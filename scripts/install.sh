@@ -14,6 +14,7 @@ BIND="0.0.0.0:8080"
 CONTROLLER_URL=""
 GIT_REPO=""
 GIT_BRANCH="main"
+COREDNS_VERSION="v1.11.1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,6 +73,52 @@ fi
 mkdir -p /opt/dns-proxy/{agent,controller,data,domains}
 mkdir -p /opt/dns-proxy/docker/{dns,proxy}
 mkdir -p /opt/dns-proxy/nftables
+
+# Native CoreDNS installer (fallback for regions blocked by registries)
+install_coredns_native() {
+  echo "Installing CoreDNS ${COREDNS_VERSION} natively (no Docker)..."
+  mkdir -p /opt/dns-proxy/bin
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64|amd64) TAR="coredns_1.11.1_linux_amd64.tgz" ;;
+    aarch64|arm64) TAR="coredns_1.11.1_linux_arm64.tgz" ;;
+    *) echo "Unsupported arch for CoreDNS: $ARCH"; return 1 ;;
+  esac
+  URL="https://github.com/coredns/coredns/releases/download/${COREDNS_VERSION}/${TAR}"
+  TMPDIR="$(mktemp -d)"
+  echo "Downloading ${URL} ..."
+  curl -fsSL "$URL" -o "$TMPDIR/coredns.tgz"
+  tar -C "$TMPDIR" -xzf "$TMPDIR/coredns.tgz"
+  install -m 0755 "$TMPDIR/coredns" /opt/dns-proxy/bin/coredns
+  rm -rf "$TMPDIR"
+
+  # Ensure Corefile exists (already copied from repo)
+  if [[ ! -f /opt/dns-proxy/docker/dns/Corefile ]]; then
+    echo "Corefile not found at /opt/dns-proxy/docker/dns/Corefile" >&2
+    return 1
+  fi
+
+  # Create systemd unit for native CoreDNS
+  cat >/etc/systemd/system/coredns-native.service <<'SVC'
+[Unit]
+Description=CoreDNS (native)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+ExecStart=/opt/dns-proxy/bin/coredns -conf /opt/dns-proxy/docker/dns/Corefile
+WorkingDirectory=/opt/dns-proxy/docker/dns
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+SVC
+  systemctl daemon-reload
+  systemctl enable --now coredns-native.service
+  echo "CoreDNS native service started."
+}
 
 cp -f "${BASE_DIR}/agent/agent.py" /opt/dns-proxy/agent/
 cp -f "${BASE_DIR}/agent/requirements.txt" /opt/dns-proxy/agent/
@@ -175,7 +222,12 @@ RCF
   touch /opt/dns-proxy/docker/dns/targets.override
   touch /opt/dns-proxy/docker/dns/v6block.override
   # Bring up DNS stack
-  (cd /opt/dns-proxy/docker/dns && docker compose up -d)
+  if (cd /opt/dns-proxy/docker/dns && docker compose up -d); then
+    echo "CoreDNS started via Docker."
+  else
+    echo "Docker-based CoreDNS failed (likely registry blocked). Falling back to native binary..."
+    install_coredns_native || { echo "Failed to install CoreDNS natively"; exit 1; }
+  fi
   # Apply base nft rules (non-enforcing by default)
   nft -f /opt/dns-proxy/nftables/dns.nft || true
   systemctl enable --now dns-proxy-agent.service
