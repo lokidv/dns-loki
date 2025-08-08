@@ -71,11 +71,17 @@ def render_v6block(domains):
 
 
 def reload_coredns():
+    # If running via Docker, send HUP to PID 1 in the container
     try:
-        run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml exec -T coredns kill -HUP 1", check=False)
+        res = run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml ps -q coredns", check=False)
+        if res.returncode == 0 and res.stdout and res.stdout.strip():
+            run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml exec -T coredns kill -HUP 1", check=False)
+            return
     except Exception:
-        # fallback restart
-        run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml restart coredns", check=False)
+        pass
+    # Otherwise, try native services (fallback)
+    run("systemctl restart coredns-native", check=False)
+    run("systemctl restart coredns", check=False)
 
 
 def render_sniproxy_conf(domains):
