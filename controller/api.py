@@ -35,7 +35,15 @@ class ConfigOut(BaseModel):
 
 def _load_state():
     os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(STATE_PATH):
+    # Try read existing state; tolerate corruption and rebuild with defaults
+    st = None
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH) as f:
+                st = json.load(f)
+        except Exception:
+            st = None
+    if not isinstance(st, dict):
         st = {
             "clients": [],
             "nodes": [],
@@ -48,8 +56,16 @@ def _load_state():
         with open(STATE_PATH, "w") as f:
             json.dump(st, f)
         return st
-    with open(STATE_PATH) as f:
-        return json.load(f)
+    # Ensure required keys exist (forward/backward compatibility)
+    st.setdefault("clients", [])
+    st.setdefault("nodes", [])
+    st.setdefault("domains_version", 1)
+    st.setdefault("git_repo", DEFAULT_GIT_REPO)
+    st.setdefault("git_branch", DEFAULT_GIT_BRANCH)
+    st.setdefault("enforce_dns_clients", False)
+    st.setdefault("enforce_proxy_clients", False)
+    _save_state(st)
+    return st
 
 
 def _save_state(st):
@@ -162,3 +178,20 @@ def set_flags(flags: Flags):
             "enforce_dns_clients": st["enforce_dns_clients"],
             "enforce_proxy_clients": st["enforce_proxy_clients"],
         }
+
+# Optional: set git_repo and git_branch via API
+class GitSettings(BaseModel):
+    git_repo: Optional[str] = None
+    git_branch: Optional[str] = None
+
+
+@app.post("/v1/git")
+def set_git(settings: GitSettings):
+    with LOCK:
+        st = _load_state()
+        if settings.git_repo is not None:
+            st["git_repo"] = settings.git_repo
+        if settings.git_branch is not None:
+            st["git_branch"] = settings.git_branch
+        _save_state(st)
+        return {"git_repo": st["git_repo"], "git_branch": st["git_branch"]}
