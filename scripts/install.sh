@@ -48,7 +48,23 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 # Compose plugin
 if ! docker compose version >/dev/null 2>&1; then
-  apt-get install -y docker-compose-plugin
+  if apt-get install -y docker-compose-plugin; then
+    echo "Installed docker-compose-plugin from apt."
+  else
+    echo "docker-compose-plugin not available via apt; installing Compose v2 binary..."
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+      x86_64|amd64) BIN="docker-compose-linux-x86_64" ;;
+      aarch64|arm64) BIN="docker-compose-linux-aarch64" ;;
+      *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+    esac
+    COMPOSE_VER="v2.27.0"
+    mkdir -p /usr/libexec/docker/cli-plugins /usr/lib/docker/cli-plugins
+    curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/${BIN}" -o /tmp/docker-compose
+    install -m 0755 /tmp/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+    install -m 0755 /tmp/docker-compose /usr/lib/docker/cli-plugins/docker-compose
+    rm -f /tmp/docker-compose
+  fi
 fi
 
 mkdir -p /opt/dns-proxy/{agent,controller,data,domains}
