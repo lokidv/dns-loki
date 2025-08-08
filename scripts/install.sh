@@ -88,9 +88,25 @@ install_coredns_native() {
   TMPDIR="$(mktemp -d)"
   echo "Downloading ${URL} ..."
   if ! curl -fsSL "$URL" -o "$TMPDIR/coredns.tgz"; then
-    echo "ERROR: Failed to download CoreDNS tarball from GitHub releases." >&2
+    echo "WARN: Failed to download CoreDNS tarball from GitHub releases. Trying apt package..." >&2
     rm -rf "$TMPDIR"
-    return 1
+    # Try apt package as fallback
+    if apt-get update -y && apt-get install -y coredns; then
+      echo "Installed CoreDNS from apt. Wiring configuration..."
+      mkdir -p /etc/coredns
+      # Ensure override files are resolvable
+      ln -sf /opt/dns-proxy/docker/dns/targets.override /etc/coredns/targets.override
+      ln -sf /opt/dns-proxy/docker/dns/v6block.override /etc/coredns/v6block.override
+      # Place our Corefile for the apt service
+      cp -f /opt/dns-proxy/docker/dns/Corefile /etc/coredns/Corefile
+      systemctl enable --now coredns
+      systemctl restart coredns || true
+      echo "CoreDNS (apt) service started."
+      return 0
+    else
+      echo "ERROR: Failed to install CoreDNS via apt as well." >&2
+      return 1
+    fi
   fi
   if [[ ! -s "$TMPDIR/coredns.tgz" ]]; then
     echo "ERROR: Downloaded file is empty." >&2
