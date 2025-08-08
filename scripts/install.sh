@@ -87,8 +87,26 @@ install_coredns_native() {
   URL="https://github.com/coredns/coredns/releases/download/${COREDNS_VERSION}/${TAR}"
   TMPDIR="$(mktemp -d)"
   echo "Downloading ${URL} ..."
-  curl -fsSL "$URL" -o "$TMPDIR/coredns.tgz"
-  tar -C "$TMPDIR" -xzf "$TMPDIR/coredns.tgz"
+  if ! curl -fsSL "$URL" -o "$TMPDIR/coredns.tgz"; then
+    echo "ERROR: Failed to download CoreDNS tarball from GitHub releases." >&2
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+  if [[ ! -s "$TMPDIR/coredns.tgz" ]]; then
+    echo "ERROR: Downloaded file is empty." >&2
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+  if ! tar -C "$TMPDIR" -xzf "$TMPDIR/coredns.tgz"; then
+    echo "ERROR: Failed to extract CoreDNS tarball." >&2
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+  if [[ ! -f "$TMPDIR/coredns" ]]; then
+    echo "ERROR: CoreDNS binary not found after extraction." >&2
+    rm -rf "$TMPDIR"
+    return 1
+  fi
   install -m 0755 "$TMPDIR/coredns" /opt/dns-proxy/bin/coredns
   rm -rf "$TMPDIR"
 
@@ -97,6 +115,11 @@ install_coredns_native() {
     echo "Corefile not found at /opt/dns-proxy/docker/dns/Corefile" >&2
     return 1
   fi
+
+  # Ensure override files are resolvable at /etc/coredns/ for Corefile imports
+  mkdir -p /etc/coredns
+  ln -sf /opt/dns-proxy/docker/dns/targets.override /etc/coredns/targets.override
+  ln -sf /opt/dns-proxy/docker/dns/v6block.override /etc/coredns/v6block.override
 
   # Create systemd unit for native CoreDNS
   cat >/etc/systemd/system/coredns-native.service <<'SVC'
@@ -116,8 +139,36 @@ RestartSec=2
 WantedBy=multi-user.target
 SVC
   systemctl daemon-reload
-  systemctl enable --now coredns-native.service
-  echo "CoreDNS native service started."
+  if [[ -x /opt/dns-proxy/bin/coredns ]]; then
+    systemctl enable --now coredns-native.service
+    echo "CoreDNS native service started."
+  else
+    echo "ERROR: CoreDNS binary missing; not starting service." >&2
+    return 1
+  fi
+}
+
+# Try multiple registries for CoreDNS and generate a compose override with the working image
+try_pull_coredns() {
+  local candidates=(
+    "registry.k8s.io/coredns/coredns:${COREDNS_VERSION}"
+    "ghcr.io/coredns/coredns:${COREDNS_VERSION}"
+    "coredns/coredns:${COREDNS_VERSION#v}"
+  )
+  for img in "${candidates[@]}"; do
+    echo "Trying to pull $img ..."
+    if docker pull "$img" >/dev/null 2>&1; then
+      echo "Pulled $img"
+      cat >/opt/dns-proxy/docker/dns/docker-compose.override.yml <<EOF
+services:
+  coredns:
+    image: ${img}
+EOF
+      return 0
+    fi
+  done
+  echo "All CoreDNS image pulls failed." >&2
+  return 1
 }
 
 cp -f "${BASE_DIR}/agent/agent.py" /opt/dns-proxy/agent/
@@ -221,7 +272,8 @@ RCF
   # Prepare CoreDNS runtime files
   touch /opt/dns-proxy/docker/dns/targets.override
   touch /opt/dns-proxy/docker/dns/v6block.override
-  # Bring up DNS stack
+  # Bring up DNS stack (try pulling from multiple registries first)
+  try_pull_coredns || echo "Will attempt native CoreDNS."
   if (cd /opt/dns-proxy/docker/dns && docker compose up -d); then
     echo "CoreDNS started via Docker."
   else
