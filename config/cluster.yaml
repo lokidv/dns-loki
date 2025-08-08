@@ -1,0 +1,19 @@
+controller:
+  bind: 0.0.0.0:8080
+  data_dir: /opt/dns-proxy/data
+  git_repo: ""
+  git_branch: main
+
+proxies:
+  - ip: 144.172.98.5
+    enabled: true
+  - ip: 144.172.103.229
+    enabled: true
+  - ip: 144.172.103.230
+    enabled: true
+
+dns_nodes:
+  - ip: 185.84.158.34
+    enabled: true
+  - ip: 87.248.154.86
+    enabled: true

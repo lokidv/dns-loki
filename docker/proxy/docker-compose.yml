@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  sniproxy:
+    image: lancachenet/sniproxy:latest
+    container_name: sniproxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./sniproxy.conf:/etc/sniproxy.conf:ro

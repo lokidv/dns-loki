@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  coredns:
+    image: coredns/coredns:1.11.1
+    container_name: coredns
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Corefile:/Corefile:ro
+      - ./targets.override:/etc/coredns/targets.override:ro
+      - ./v6block.override:/etc/coredns/v6block.override:ro
+    command: ["-conf", "/Corefile"]

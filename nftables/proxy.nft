@@ -1,0 +1,17 @@
+table inet filter {
+  sets {
+    allow_proxy_clients { type ipv4_addr; flags interval; }
+  }
+  chains {
+    input {
+      type filter hook input priority 0;
+      # Accept SSH
+      tcp dport 22 accept
+      # Block QUIC/HTTP3
+      udp dport 443 drop
+      # Web ports (will be restricted by agent when enforcement toggled)
+      tcp dport 80 accept
+      tcp dport 443 accept
+    }
+  }
+}

@@ -1,0 +1,11 @@
+. {
+  log
+  errors
+  cache 30
+  reload
+
+  import /etc/coredns/targets.override
+  import /etc/coredns/v6block.override
+
+  forward . 1.1.1.1 1.0.0.1
+}
