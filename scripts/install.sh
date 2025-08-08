@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Universal installer for DNS/Proxy nodes and Controller
 # Usage examples:
@@ -71,15 +73,15 @@ mkdir -p /opt/dns-proxy/{agent,controller,data,domains}
 mkdir -p /opt/dns-proxy/docker/{dns,proxy}
 mkdir -p /opt/dns-proxy/nftables
 
-cp -f agent/agent.py /opt/dns-proxy/agent/
-cp -f agent/requirements.txt /opt/dns-proxy/agent/
-cp -f controller/api.py /opt/dns-proxy/controller/ || true
-cp -f controller/requirements.txt /opt/dns-proxy/controller/ || true
-cp -f docker/dns/docker-compose.yml /opt/dns-proxy/docker/dns/
-cp -f docker/dns/Corefile /opt/dns-proxy/docker/dns/
-cp -f docker/proxy/docker-compose.yml /opt/dns-proxy/docker/proxy/
-cp -f docker/proxy/sniproxy.conf.tmpl /opt/dns-proxy/docker/proxy/
-cp -f nftables/*.nft /opt/dns-proxy/nftables/ 2>/dev/null || true
+cp -f "${BASE_DIR}/agent/agent.py" /opt/dns-proxy/agent/
+cp -f "${BASE_DIR}/agent/requirements.txt" /opt/dns-proxy/agent/
+cp -f "${BASE_DIR}/controller/api.py" /opt/dns-proxy/controller/ || true
+cp -f "${BASE_DIR}/controller/requirements.txt" /opt/dns-proxy/controller/ || true
+cp -f "${BASE_DIR}/docker/dns/docker-compose.yml" /opt/dns-proxy/docker/dns/
+cp -f "${BASE_DIR}/docker/dns/Corefile" /opt/dns-proxy/docker/dns/
+cp -f "${BASE_DIR}/docker/proxy/docker-compose.yml" /opt/dns-proxy/docker/proxy/
+cp -f "${BASE_DIR}/docker/proxy/sniproxy.conf.tmpl" /opt/dns-proxy/docker/proxy/
+cp -f "${BASE_DIR}/nftables"/*.nft /opt/dns-proxy/nftables/ 2>/dev/null || true
 
 # Agent config
 cat >/opt/dns-proxy/agent/agent.yaml <<EOF
