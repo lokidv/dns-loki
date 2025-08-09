@@ -17,8 +17,9 @@
     .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; }
     .col-6{ grid-column: span 6; }
     .col-4{ grid-column: span 4; }
+    .col-8{ grid-column: span 8; }
     .col-12{ grid-column: span 12; }
-    @media (max-width: 900px){ .col-6, .col-4 { grid-column: span 12; } }
+    @media (max-width: 900px){ .col-6, .col-4, .col-8 { grid-column: span 12; } }
     .card { background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid var(--border); border-radius:12px; padding:16px; backdrop-filter: blur(6px); }
     input, button, select, textarea { background:var(--surface-2); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
     button { cursor:pointer; transition:.2s; }

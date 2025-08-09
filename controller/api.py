@@ -298,11 +298,26 @@ class CodeSettings(BaseModel):
 
 
 def _github_zip_url(repo_url: str, branch: str) -> Optional[str]:
-    # support URLs like https://github.com/owner/repo.git or https://github.com/owner/repo
-    m = re.search(r"github\\.com/([^/]+)/([^/.]+)", repo_url)
-    if not m:
+    # پشتیبانی از حالت‌های متداول URL گیت‌هاب:
+    # - https://github.com/owner/repo.git
+    # - https://github.com/owner/repo
+    # - http://github.com/owner/repo(.git)
+    # - git@github.com:owner/repo(.git)
+    if not repo_url:
         return None
-    owner, repo = m.group(1), m.group(2)
+    s = repo_url.strip()
+    # تطبیق حالت SSH مانند git@github.com:owner/repo(.git)
+    m_ssh = re.match(r"git@github\.com:([^/]+)/([^/]+)(?:\.git)?$", s)
+    if m_ssh:
+        owner, repo = m_ssh.group(1), m_ssh.group(2)
+        return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+
+    # تطبیق حالت‌های http/https با/بدون www و با/بدون .git
+    m_http = re.search(r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)", s)
+    if not m_http:
+        return None
+    owner, repo = m_http.group(1), m_http.group(2)
+    repo = repo[:-4] if repo.endswith('.git') else repo
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
