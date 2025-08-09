@@ -7,7 +7,7 @@ resolver {
 
 # HTTP proxy section
 listener 0.0.0.0:80 {
-  proto http
+  protocol http
   table {
 #__TABLE__
   }
@@ -15,7 +15,7 @@ listener 0.0.0.0:80 {
 
 # TLS SNI proxy section
 listener 0.0.0.0:443 {
-  proto tls
+  protocol tls
   table {
 #__TABLE__
   }
