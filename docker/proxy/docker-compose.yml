@@ -6,4 +6,4 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./sniproxy.conf:/etc/sniproxy.conf:ro
+      - ./sniproxy.conf:/etc/sniproxy.conf
