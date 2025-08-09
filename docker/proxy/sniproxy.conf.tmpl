@@ -6,17 +6,16 @@ resolver {
 }
 
 # HTTP proxy section
-listener 0.0.0.0:80 {
+listen 0.0.0.0:80 {
   protocol http
-  table {
-#__TABLE__
-  }
 }
 
 # TLS SNI proxy section
-listener 0.0.0.0:443 {
+listen 0.0.0.0:443 {
   protocol tls
-  table {
+}
+
+# Default table used by listeners above
+table {
 #__TABLE__
-  }
 }
