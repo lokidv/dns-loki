@@ -93,7 +93,9 @@ def add_client(c: Client):
         st = _load_state()
         if any(str(x["ip"]) == str(c.ip) for x in st["clients"]):
             return st["clients"]
-        st["clients"].append(c.dict())
+        # Ensure JSON-serializable payload (ip as string)
+        payload = json.loads(c.json())
+        st["clients"].append(payload)
         _save_state(st)
         return st["clients"]
 
@@ -118,13 +120,14 @@ def list_nodes():
 def upsert_node(n: Node):
     with LOCK:
         st = _load_state()
+        n_payload = json.loads(n.json())  # ensure ip is string for JSON persistence
         found = False
         for x in st["nodes"]:
             if str(x["ip"]) == str(n.ip):
-                x.update(n.dict())
+                x.update(n_payload)
                 found = True
         if not found:
-            st["nodes"].append(n.dict())
+            st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]
 
