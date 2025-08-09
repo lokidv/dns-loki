@@ -8,11 +8,15 @@ import time
 import requests
 import yaml
 from pathlib import Path
+import tempfile
+import zipfile
+from urllib.request import urlopen
 
 DEF_CORE_DNS_DIR = "/opt/dns-proxy/docker/dns"
 DEF_PROXY_DIR = "/opt/dns-proxy/docker/proxy"
 WORK_DIR = "/opt/dns-proxy"
 DOMAINS_DIR = f"{WORK_DIR}/domains"
+LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
 
 
 def run(cmd, check=True):
@@ -34,6 +38,61 @@ def ensure_git_repo(repo_url: str, branch: str):
             run(f"git -C {DOMAINS_DIR} remote set-url origin {repo_url}")
         run(f"git -C {DOMAINS_DIR} fetch --all")
         run(f"git -C {DOMAINS_DIR} reset --hard origin/{branch}")
+
+
+def _github_zip_url(repo_url: str, branch: str):
+    m = re.search(r"github\\.com/([^/]+)/([^/.]+)", repo_url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+
+
+def update_code_from_repo(repo_url: str, branch: str, role: str):
+    url = _github_zip_url(repo_url, branch)
+    if not url:
+        return False
+    tmpdir = tempfile.mkdtemp(prefix="dns_loki_node_")
+    zip_path = os.path.join(tmpdir, "src.zip")
+    try:
+        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmpdir)
+        root = None
+        for name in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, name)
+            if os.path.isdir(p) and name.startswith("dns-loki-"):
+                root = p
+                break
+        if not root:
+            return False
+        # Always update agent code
+        shutil.copy2(os.path.join(root, "agent", "agent.py"), f"{WORK_DIR}/agent/agent.py")
+        if os.path.exists(os.path.join(root, "agent", "requirements.txt")):
+            shutil.copy2(os.path.join(root, "agent", "requirements.txt"), f"{WORK_DIR}/agent/requirements.txt")
+        # Update role-specific runtime files
+        if role == "dns":
+            # docker/dns and nftables
+            dns_src = os.path.join(root, "docker", "dns")
+            if os.path.isdir(dns_src):
+                shutil.copy2(os.path.join(dns_src, "docker-compose.yml"), f"{WORK_DIR}/docker/dns/docker-compose.yml")
+                shutil.copy2(os.path.join(dns_src, "Corefile"), f"{WORK_DIR}/docker/dns/Corefile")
+        if role == "proxy":
+            prx_src = os.path.join(root, "docker", "proxy")
+            if os.path.isdir(prx_src):
+                shutil.copy2(os.path.join(prx_src, "docker-compose.yml"), f"{WORK_DIR}/docker/proxy/docker-compose.yml")
+                tmpl = os.path.join(prx_src, "sniproxy.conf.tmpl")
+                if os.path.exists(tmpl):
+                    shutil.copy2(tmpl, f"{WORK_DIR}/docker/proxy/sniproxy.conf.tmpl")
+        # Reinstall agent deps (best-effort)
+        try:
+            run(f"{WORK_DIR}/agent/venv/bin/pip install -r {WORK_DIR}/agent/requirements.txt", check=False)
+        except Exception:
+            pass
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def read_domains_list():
@@ -190,7 +249,15 @@ def main():
     git_branch = cfg.get("git_branch", "main")
 
     domains_version_seen = None
+    # track applied agents_version on disk to avoid loops across restarts
+    agents_version_applied = None
+    try:
+        if Path(LAST_VER_FILE).exists():
+            agents_version_applied = int(Path(LAST_VER_FILE).read_text().strip())
+    except Exception:
+        agents_version_applied = None
     self_registered = False
+    my_ip = None
 
     while True:
         try:
@@ -199,20 +266,51 @@ def main():
             time.sleep(5)
             continue
 
-        # Self-register node once
+        # Self-discover ip once
         if not self_registered:
             try:
                 my_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
-                requests.post(f"{controller_url}/v1/nodes", json={"ip": my_ip, "role": role, "enabled": True}, timeout=5)
                 self_registered = True
             except Exception:
-                pass
+                my_ip = None
+
+        # Heartbeat / upsert node each loop with version and timestamp
+        try:
+            if my_ip:
+                hb = {
+                    "ip": my_ip,
+                    "role": role,
+                    "enabled": True,
+                    "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
+                    "ts": time.time(),
+                }
+                requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+        except Exception:
+            pass
 
         clients = [c["ip"] for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns","proxy"]) ]
         proxies = [n for n in conf.get("nodes", []) if n.get("role") == "proxy" and n.get("enabled", True)]
         proxy_ips = [str(n["ip"]) for n in proxies]
         enforce_dns = conf.get("enforce_dns_clients", False)
         enforce_proxy = conf.get("enforce_proxy_clients", False)
+
+        # Handle code update trigger for agents
+        code_repo = conf.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
+        code_branch = conf.get("code_branch") or "main"
+        agents_version_conf = int(conf.get("agents_version", 1))
+        if agents_version_applied is None or agents_version_applied != agents_version_conf:
+            if update_code_from_repo(code_repo, code_branch, role or ""):
+                try:
+                    Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
+                    Path(LAST_VER_FILE).write_text(str(agents_version_conf))
+                except Exception:
+                    pass
+                # restart self to load new code
+                try:
+                    run("systemctl restart dns-proxy-agent", check=False)
+                    time.sleep(2)
+                except Exception:
+                    pass
 
         # Sync domains based on source of truth
         domains = []

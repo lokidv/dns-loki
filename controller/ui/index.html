@@ -43,6 +43,18 @@
     <div class="card">
       <h2>وضعیت</h2>
       <div id="cfg"></div>
+      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="btnSelfUpdate">آپدیت کنترلر</button>
+        <button id="btnNodesUpdate">آپدیت نودها (Agent)</button>
+      </div>
+      <details style="margin-top:10px;">
+        <summary>تنظیم ریپو و برنچ کد</summary>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input id="codeRepo" placeholder="https://github.com/lokidv/dns-loki.git" style="min-width:360px" />
+          <input id="codeBranch" placeholder="main" style="width:140px" />
+          <button id="btnSaveCode">ثبت</button>
+        </div>
+      </details>
     </div>
   </div>
 
@@ -69,10 +81,15 @@ async function loadConfig(){
   const dv = document.createElement('div');
   dv.innerHTML = `
     <div>نسخه دامنه‌ها: <span class="pill">${j.domains_version}</span></div>
-    <div>ریپو: <code>${j.git_repo || '—'}</code> | برنچ: <code>${j.git_branch}</code></div>
+    <div>ریپو دامنه‌ها: <code>${j.git_repo || '—'}</code> | برنچ: <code>${j.git_branch}</code></div>
+    <div>ریپو کد: <code>${j.code_repo}</code> | برنچ: <code>${j.code_branch}</code></div>
+    <div>نسخه ایجنت‌ها: <span class="pill">${j.agents_version}</span></div>
     <div>DNS enforce: <b>${j.enforce_dns_clients}</b> | Proxy enforce: <b>${j.enforce_proxy_clients}</b></div>
   `;
   el.appendChild(dv);
+  // fill inputs
+  document.getElementById('codeRepo').value = j.code_repo || '';
+  document.getElementById('codeBranch').value = j.code_branch || 'main';
 }
 
 async function loadDomains(){
@@ -140,6 +157,35 @@ const syncBtn = document.getElementById('syncBtn');
 syncBtn.onclick = async ()=>{
   await api('/v1/domains/sync', { method:'POST' });
   await loadConfig();
+};
+
+// save code repo/branch
+document.getElementById('btnSaveCode').onclick = async ()=>{
+  const repo = document.getElementById('codeRepo').value.trim();
+  const branch = document.getElementById('codeBranch').value.trim() || 'main';
+  await api('/v1/code', { method:'POST', body: JSON.stringify({ code_repo: repo, code_branch: branch })});
+  await loadConfig();
+};
+
+// controller self-update
+document.getElementById('btnSelfUpdate').onclick = async ()=>{
+  try {
+    await api('/v1/code/self-update', { method:'POST' });
+    alert('در حال ری‌استارت کنترلر... چند ثانیه صبر کنید و صفحه را رفرش کنید.');
+  } catch (e) {
+    alert('خطا در آپدیت کنترلر');
+  }
+};
+
+// nodes update trigger
+document.getElementById('btnNodesUpdate').onclick = async ()=>{
+  try {
+    await api('/v1/nodes/update', { method:'POST' });
+    await loadConfig();
+    alert('سیگنال آپدیت ایجنت‌ها ارسال شد.');
+  } catch (e) {
+    alert('خطا در آپدیت نودها');
+  }
 };
 </script>
 </body>

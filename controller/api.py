@@ -1,6 +1,13 @@
 import os
 import json
 import threading
+import re
+import tempfile
+import shutil
+import zipfile
+import subprocess
+import time
+from urllib.request import urlopen
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, IPvAnyAddress
@@ -35,6 +42,8 @@ class Node(BaseModel):
     ip: IPvAnyAddress
     role: str  # dns|proxy
     enabled: bool = True
+    agents_version_applied: Optional[int] = None
+    ts: Optional[float] = None
 
 class ConfigOut(BaseModel):
     clients: List[Client]
@@ -42,6 +51,9 @@ class ConfigOut(BaseModel):
     domains_version: int
     git_repo: str
     git_branch: str
+    agents_version: int
+    code_repo: str
+    code_branch: str
     enforce_dns_clients: bool = False
     enforce_proxy_clients: bool = False
 
@@ -69,6 +81,9 @@ def _load_state():
             "domains_version": 1,
             "git_repo": DEFAULT_GIT_REPO,
             "git_branch": DEFAULT_GIT_BRANCH,
+            "agents_version": 1,
+            "code_repo": os.environ.get("CODE_REPO", "https://github.com/lokidv/dns-loki.git"),
+            "code_branch": os.environ.get("CODE_BRANCH", "main"),
             "enforce_dns_clients": False,
             "enforce_proxy_clients": False,
             "domains": [],
@@ -82,6 +97,9 @@ def _load_state():
     st.setdefault("domains_version", 1)
     st.setdefault("git_repo", DEFAULT_GIT_REPO)
     st.setdefault("git_branch", DEFAULT_GIT_BRANCH)
+    st.setdefault("agents_version", 1)
+    st.setdefault("code_repo", os.environ.get("CODE_REPO", "https://github.com/lokidv/dns-loki.git"))
+    st.setdefault("code_branch", os.environ.get("CODE_BRANCH", "main"))
     st.setdefault("enforce_dns_clients", False)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
@@ -272,3 +290,112 @@ def set_git(settings: GitSettings):
             st["git_branch"] = settings.git_branch
         _save_state(st)
         return {"git_repo": st["git_repo"], "git_branch": st["git_branch"]}
+
+# ===== Code update management =====
+class CodeSettings(BaseModel):
+    code_repo: Optional[str] = None
+    code_branch: Optional[str] = None
+
+
+def _github_zip_url(repo_url: str, branch: str) -> Optional[str]:
+    # support URLs like https://github.com/owner/repo.git or https://github.com/owner/repo
+    m = re.search(r"github\\.com/([^/]+)/([^/.]+)", repo_url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+
+
+def _copy_tree(src: str, dst: str):
+    os.makedirs(dst, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = os.path.join(dst, rel) if rel != "." else dst
+        os.makedirs(target_root, exist_ok=True)
+        for f in files:
+            shutil.copy2(os.path.join(root, f), os.path.join(target_root, f))
+
+
+@app.post("/v1/code")
+def set_code_repo(settings: CodeSettings):
+    with LOCK:
+        st = _load_state()
+        if settings.code_repo is not None:
+            st["code_repo"] = settings.code_repo
+        if settings.code_branch is not None:
+            st["code_branch"] = settings.code_branch
+        _save_state(st)
+        return {"code_repo": st["code_repo"], "code_branch": st["code_branch"]}
+
+
+@app.post("/v1/nodes/update")
+def update_nodes(settings: CodeSettings = None):
+    with LOCK:
+        st = _load_state()
+        if settings and settings.code_repo is not None:
+            st["code_repo"] = settings.code_repo
+        if settings and settings.code_branch is not None:
+            st["code_branch"] = settings.code_branch
+        st["agents_version"] = int(st.get("agents_version", 1)) + 1
+        _save_state(st)
+        return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
+
+
+@app.post("/v1/code/self-update")
+def self_update_controller():
+    """Download latest code and update controller files and UI, then restart service in background."""
+    with LOCK:
+        st = _load_state()
+        repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
+        branch = st.get("code_branch") or "main"
+
+    url = _github_zip_url(repo, branch)
+    if not url:
+        raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
+
+    tmpdir = tempfile.mkdtemp(prefix="dns_loki_upd_")
+    zip_path = os.path.join(tmpdir, "src.zip")
+    try:
+        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmpdir)
+        # find extracted root
+        root = None
+        for name in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, name)
+            if os.path.isdir(p) and name.startswith("dns-loki-"):
+                root = p
+                break
+        if not root:
+            raise HTTPException(status_code=500, detail="Cannot locate extracted source root")
+
+        # copy controller files
+        shutil.copy2(os.path.join(root, "controller", "api.py"), "/opt/dns-proxy/controller/api.py")
+        if os.path.exists(os.path.join(root, "controller", "requirements.txt")):
+            shutil.copy2(os.path.join(root, "controller", "requirements.txt"), "/opt/dns-proxy/controller/requirements.txt")
+        # copy UI
+        ui_src = os.path.join(root, "controller", "ui")
+        if os.path.isdir(ui_src):
+            if os.path.isdir("/opt/dns-proxy/controller/ui"):
+                shutil.rmtree("/opt/dns-proxy/controller/ui")
+            _copy_tree(ui_src, "/opt/dns-proxy/controller/ui")
+        # upgrade controller deps
+        try:
+            subprocess.run([
+                "/opt/dns-proxy/controller/venv/bin/pip", "install", "-r", "/opt/dns-proxy/controller/requirements.txt"
+            ], check=False)
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # restart controller in background after short delay
+    try:
+        subprocess.Popen([
+            "bash", "-lc", "sleep 1; systemctl restart dns-proxy-controller"
+        ])
+    except Exception:
+        pass
+
+    return {"ok": True, "restarting": True}
