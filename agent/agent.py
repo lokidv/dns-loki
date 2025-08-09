@@ -25,6 +25,13 @@ def ensure_git_repo(repo_url: str, branch: str):
     if not (Path(DOMAINS_DIR) / ".git").exists():
         run(f"git clone -b {branch} {repo_url} {DOMAINS_DIR}")
     else:
+        # ensure remote origin URL matches desired repo_url
+        try:
+            cur = subprocess.check_output(["git", "-C", DOMAINS_DIR, "remote", "get-url", "origin"], text=True).strip()
+        except Exception:
+            cur = ""
+        if cur != repo_url:
+            run(f"git -C {DOMAINS_DIR} remote set-url origin {repo_url}")
         run(f"git -C {DOMAINS_DIR} fetch --all")
         run(f"git -C {DOMAINS_DIR} reset --hard origin/{branch}")
 
@@ -36,6 +43,27 @@ def read_domains_list():
     lines = [l.strip() for l in path.read_text(encoding='utf-8').splitlines()]
     domains = [l for l in lines if l and not l.startswith('#')]
     return domains
+
+def fetch_domains_from_api(controller_url: str):
+    try:
+        r = requests.get(f"{controller_url}/v1/domains", timeout=5)
+        if r.status_code == 200:
+            items = r.json()
+            if isinstance(items, list):
+                # normalize here as well
+                out = []
+                seen = set()
+                for d in items:
+                    d = str(d).strip().lower()
+                    if d.startswith('*.'):
+                        d = d[2:]
+                    if d and d not in seen:
+                        seen.add(d)
+                        out.append(d)
+                return out
+    except Exception:
+        pass
+    return []
 
 
 def build_regex_from_domains(domains):
@@ -186,13 +214,20 @@ def main():
         enforce_dns = conf.get("enforce_dns_clients", False)
         enforce_proxy = conf.get("enforce_proxy_clients", False)
 
-        # Sync domains if version bumped
-        if conf.get("git_repo") and (domains_version_seen != conf.get("domains_version")):
-            ensure_git_repo(conf["git_repo"], conf.get("git_branch", "main"))
-            domains_version_seen = conf.get("domains_version")
-
-        domains = read_domains_list()
-        # If domains empty, ensure amd.com as seed to allow testing
+        # Sync domains based on source of truth
+        domains = []
+        use_git = bool(conf.get("git_repo"))
+        if use_git:
+            if domains_version_seen != conf.get("domains_version"):
+                ensure_git_repo(conf["git_repo"], conf.get("git_branch", "main"))
+                domains_version_seen = conf.get("domains_version")
+            domains = read_domains_list()
+        else:
+            # pull from API; refresh each loop is cheap, rendering is idempotent
+            if domains_version_seen != conf.get("domains_version"):
+                domains_version_seen = conf.get("domains_version")
+            domains = fetch_domains_from_api(controller_url)
+        # Fallback seed for testing if still empty
         if not domains:
             domains = ["amd.com", "*.amd.com"]
 

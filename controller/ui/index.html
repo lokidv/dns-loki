@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DNS+SNI Control UI</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; background:#0b1020; color:#e7ecff; }
+    h1,h2 { margin: 8px 0; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .card { background:#141a32; border:1px solid #2b355e; border-radius:10px; padding:16px; flex:1; min-width:320px; }
+    input, button, select, textarea { background:#0f1530; color:#e7ecff; border:1px solid #2b355e; border-radius:8px; padding:8px 12px; }
+    button { cursor:pointer; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid #2b355e; padding:6px 8px; }
+    code { background:#0f1530; padding:2px 6px; border-radius:6px; }
+    .muted { color:#a8b3d0; font-size:13px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#203066; margin-left:6px; }
+    .row-actions button { margin-left:6px; }
+    .ok { color:#9cff93; }
+    .err { color:#ff7b7b; }
+  </style>
+</head>
+<body>
+  <h1>DNS+SNI Control UI</h1>
+  <div class="row">
+    <div class="card" style="max-width:420px;">
+      <h2>دامنه‌ها</h2>
+      <form id="addForm">
+        <input id="domainInput" placeholder="example.com" required />
+        <button type="submit">افزودن</button>
+      </form>
+      <div class="muted">افزودن دامنه روت کافی است؛ زیر‌دامنه‌ها خودکار پوشش داده می‌شوند.</div>
+      <div style="margin-top:10px">
+        <button id="syncBtn">سینک (بامپ ورژن)</button>
+      </div>
+      <table style="margin-top:10px">
+        <thead><tr><th>دامنه</th><th>عملیات</th></tr></thead>
+        <tbody id="domainsBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>وضعیت</h2>
+      <div id="cfg"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>کلاینت‌ها</h2>
+      <div class="muted">لیست کلاینت‌های مجاز و محدوده‌ها</div>
+      <div id="clients"></div>
+    </div>
+    <div class="card">
+      <h2>نودها</h2>
+      <div id="nodes"></div>
+    </div>
+  </div>
+
+<script>
+const api = (path, opts={}) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+
+async function loadConfig(){
+  const r = await api('/v1/config');
+  const j = await r.json();
+  const el = document.getElementById('cfg');
+  el.innerHTML = '';
+  const dv = document.createElement('div');
+  dv.innerHTML = `
+    <div>نسخه دامنه‌ها: <span class="pill">${j.domains_version}</span></div>
+    <div>ریپو: <code>${j.git_repo || '—'}</code> | برنچ: <code>${j.git_branch}</code></div>
+    <div>DNS enforce: <b>${j.enforce_dns_clients}</b> | Proxy enforce: <b>${j.enforce_proxy_clients}</b></div>
+  `;
+  el.appendChild(dv);
+}
+
+async function loadDomains(){
+  const r = await api('/v1/domains');
+  const arr = await r.json();
+  const body = document.getElementById('domainsBody');
+  body.innerHTML = '';
+  arr.forEach(d => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><code>${d}</code></td><td class="row-actions"><button data-d="${d}">حذف</button></td>`;
+    tr.querySelector('button').onclick = async (ev) => {
+      const dom = ev.target.getAttribute('data-d');
+      const r = await api(`/v1/domains/${encodeURIComponent(dom)}`, { method:'DELETE' });
+      await loadDomains();
+      await loadConfig();
+    };
+    body.appendChild(tr);
+  });
+}
+
+async function loadClients(){
+  const r = await api('/v1/clients');
+  const arr = await r.json();
+  const el = document.getElementById('clients');
+  el.innerHTML = '';
+  arr.forEach(c => {
+    const d = document.createElement('div');
+    d.innerHTML = `<code>${c.ip}</code> <span class="muted">(${(c.scope||[]).join(',')})</span>`;
+    el.appendChild(d);
+  });
+}
+
+async function loadNodes(){
+  const r = await api('/v1/nodes');
+  const arr = await r.json();
+  const el = document.getElementById('nodes');
+  el.innerHTML = '';
+  arr.forEach(n => {
+    const d = document.createElement('div');
+    d.innerHTML = `<code>${n.ip}</code> <span class="pill">${n.role}</span> ${n.enabled ? '<span class="ok">فعال</span>' : '<span class="err">غیرفعال</span>'}`;
+    el.appendChild(d);
+  });
+}
+
+async function init(){
+  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+}
+
+init();
+
+// add domain form
+const addForm = document.getElementById('addForm');
+addForm.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const dom = document.getElementById('domainInput').value.trim();
+  if(!dom) return;
+  const r = await api('/v1/domains/add', { method:'POST', body: JSON.stringify({domain: dom})});
+  document.getElementById('domainInput').value = '';
+  await loadDomains();
+  await loadConfig();
+});
+
+// sync button
+const syncBtn = document.getElementById('syncBtn');
+syncBtn.onclick = async ()=>{
+  await api('/v1/domains/sync', { method:'POST' });
+  await loadConfig();
+};
+</script>
+</body>
+</html>

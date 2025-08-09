@@ -4,6 +4,8 @@ import threading
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, IPvAnyAddress
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -12,6 +14,17 @@ STATE_PATH = os.path.join(DATA_DIR, "state.json")
 LOCK = threading.Lock()
 
 app = FastAPI(title="DNS+SNI Control Plane")
+
+# Serve simple UI if available
+UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
+if os.path.isdir(UI_DIR):
+    app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
+
+@app.get("/")
+def root():
+    if os.path.isdir(UI_DIR):
+        return RedirectResponse(url="/ui/")
+    return {"ok": True}
 
 class Client(BaseModel):
     ip: IPvAnyAddress
@@ -31,6 +44,12 @@ class ConfigOut(BaseModel):
     git_branch: str
     enforce_dns_clients: bool = False
     enforce_proxy_clients: bool = False
+
+class DomainsPayload(BaseModel):
+    domains: List[str]
+
+class DomainItem(BaseModel):
+    domain: str
 
 
 def _load_state():
@@ -52,6 +71,7 @@ def _load_state():
             "git_branch": DEFAULT_GIT_BRANCH,
             "enforce_dns_clients": False,
             "enforce_proxy_clients": False,
+            "domains": [],
         }
         with open(STATE_PATH, "w") as f:
             json.dump(st, f)
@@ -64,6 +84,7 @@ def _load_state():
     st.setdefault("git_branch", DEFAULT_GIT_BRANCH)
     st.setdefault("enforce_dns_clients", False)
     st.setdefault("enforce_proxy_clients", False)
+    st.setdefault("domains", [])
     _save_state(st)
     return st
 
@@ -161,6 +182,59 @@ def bump_domains_version():
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
         _save_state(st)
         return {"domains_version": st["domains_version"]}
+
+# Domains CRUD API (store in controller state; Agent can consume directly if git_repo is empty)
+@app.get("/v1/domains", response_model=List[str])
+def get_domains():
+    with LOCK:
+        st = _load_state()
+        return st.get("domains", [])
+
+@app.post("/v1/domains", response_model=List[str])
+def set_domains(payload: DomainsPayload):
+    with LOCK:
+        st = _load_state()
+        # normalize and deduplicate
+        items = []
+        seen = set()
+        for d in payload.domains:
+            d = str(d).strip().lower()
+            if not d:
+                continue
+            if d.startswith("*."):
+                d = d[2:]
+            if d not in seen:
+                seen.add(d)
+                items.append(d)
+        st["domains"] = items
+        st["domains_version"] = int(st.get("domains_version", 1)) + 1
+        _save_state(st)
+        return st["domains"]
+
+@app.post("/v1/domains/add", response_model=List[str])
+def add_domain(item: DomainItem):
+    with LOCK:
+        st = _load_state()
+        d = str(item.domain).strip().lower()
+        if d.startswith("*."):
+            d = d[2:]
+        if d and d not in st.get("domains", []):
+            st["domains"].append(d)
+            st["domains_version"] = int(st.get("domains_version", 1)) + 1
+            _save_state(st)
+        return st.get("domains", [])
+
+@app.delete("/v1/domains/{domain}", response_model=List[str])
+def delete_domain(domain: str):
+    with LOCK:
+        st = _load_state()
+        d = str(domain).strip().lower()
+        if d.startswith("*."):
+            d = d[2:]
+        st["domains"] = [x for x in st.get("domains", []) if x != d]
+        st["domains_version"] = int(st.get("domains_version", 1)) + 1
+        _save_state(st)
+        return st.get("domains", [])
 
 
 class Flags(BaseModel):
