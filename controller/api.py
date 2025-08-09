@@ -360,15 +360,19 @@ def self_update_controller():
             shutil.copyfileobj(resp, f)
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmpdir)
-        # find extracted root
+        # find extracted root (robust for any repo name)
         root = None
         for name in os.listdir(tmpdir):
             p = os.path.join(tmpdir, name)
-            if os.path.isdir(p) and name.startswith("dns-loki-"):
-                root = p
-                break
+            if os.path.isdir(p):
+                # prefer a directory that contains controller/api.py
+                if os.path.exists(os.path.join(p, "controller", "api.py")):
+                    root = p
+                    break
+                if root is None:
+                    root = p
         if not root:
-            raise HTTPException(status_code=500, detail="Cannot locate extracted source root")
+            raise HTTPException(status_code=500, detail="Cannot locate extracted source root (zip format unexpected)")
 
         # copy controller files
         shutil.copy2(os.path.join(root, "controller", "api.py"), "/opt/dns-proxy/controller/api.py")
