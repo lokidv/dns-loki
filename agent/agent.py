@@ -97,7 +97,11 @@ def render_sniproxy_conf(domains):
 
 
 def restart_sniproxy():
-    run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
+    # Prefer graceful reload to minimize downtime
+    res = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml kill --signal=HUP sniproxy", check=False)
+    if res.returncode != 0:
+        # Fallback to restart if HUP unsupported or container not running
+        run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
 
 
 def nft_ensure_set(set_name: str):
