@@ -5,6 +5,7 @@ services:
     container_name: sniproxy
     restart: unless-stopped
     network_mode: host
-    command: ["/usr/sbin/sniproxy","-f","-c","/etc/sniproxy.conf"]
+    entrypoint: ["/usr/sbin/sniproxy"]
+    command: ["-f","-c","/etc/sniproxy.conf"]
     volumes:
       - ./sniproxy.conf:/etc/sniproxy.conf
