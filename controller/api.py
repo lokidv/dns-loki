@@ -321,6 +321,11 @@ class CodeSettings(BaseModel):
     code_repo: Optional[str] = None
     code_branch: Optional[str] = None
 
+class AgentsVersionPayload(BaseModel):
+    agents_version: Optional[int] = None
+    code_repo: Optional[str] = None
+    code_branch: Optional[str] = None
+
 
 def _github_zip_url(repo_url: str, branch: str) -> Optional[str]:
     # پشتیبانی از حالت‌های متداول URL گیت‌هاب:
@@ -377,6 +382,28 @@ def update_nodes(settings: CodeSettings = None):
         if settings and settings.code_branch is not None:
             st["code_branch"] = settings.code_branch
         st["agents_version"] = int(st.get("agents_version", 1)) + 1
+        _save_state(st)
+        return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
+
+
+@app.post("/v1/nodes/version")
+def set_agents_version(payload: AgentsVersionPayload):
+    """Set the agents_version explicitly (or bump by 1 if not provided).
+    Optionally update code_repo/code_branch alongside.
+    """
+    with LOCK:
+        st = _load_state()
+        if payload and payload.code_repo is not None:
+            st["code_repo"] = payload.code_repo
+        if payload and payload.code_branch is not None:
+            st["code_branch"] = payload.code_branch
+        if payload and payload.agents_version is not None:
+            try:
+                st["agents_version"] = int(payload.agents_version)
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid agents_version")
+        else:
+            st["agents_version"] = int(st.get("agents_version", 1)) + 1
         _save_state(st)
         return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 

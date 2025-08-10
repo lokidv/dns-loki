@@ -93,6 +93,14 @@
         <button id="btnNodesUpdate">آپدیت نودها (Agent)</button>
       </div>
       <details style="margin-top:10px;">
+        <summary>مدیریت نسخه Agent</summary>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input id="agentsTarget" placeholder="نسخه هدف" style="width:140px" />
+          <button id="btnSetAgentsVersion">تنظیم نسخه هدف</button>
+          <button id="btnAutoSync">همگام‌سازی خودکار</button>
+        </div>
+      </details>
+      <details style="margin-top:10px;">
         <summary>تنظیم ریپو و برنچ کد</summary>
         <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input id="codeRepo" placeholder="https://github.com/lokidv/dns-loki.git" style="min-width:360px" />
@@ -160,6 +168,8 @@ async function loadConfig(){
   // fill inputs
   document.getElementById('codeRepo').value = j.code_repo || '';
   document.getElementById('codeBranch').value = j.code_branch || 'main';
+  const at = document.getElementById('agentsTarget');
+  if(at) at.value = (j.agents_version!=null ? j.agents_version : '');
 }
 
 async function loadDomains(){
@@ -372,6 +382,65 @@ document.getElementById('btnNodesUpdate').onclick = async ()=>{
     alert('سیگنال آپدیت ایجنت‌ها ارسال شد.');
   } catch (e) {
     alert('خطا در آپدیت نودها: ' + (e?.message || e));
+  }
+};
+
+// set explicit agents version
+document.getElementById('btnSetAgentsVersion').onclick = async ()=>{
+  const val = (document.getElementById('agentsTarget').value || '').trim();
+  if(!val){ alert('لطفاً نسخه هدف را وارد کنید.'); return; }
+  const num = parseInt(val, 10);
+  if(isNaN(num) || num < 0){ alert('نسخه نامعتبر است.'); return; }
+  const r = await api('/v1/nodes/version', { method:'POST', body: JSON.stringify({ agents_version: num })});
+  if(!r.ok){ const t = await r.text(); alert('خطا در تنظیم نسخه: ' + t); return; }
+  await loadConfig();
+  await loadNodes();
+  alert('نسخه هدف تنظیم شد.');
+};
+
+// auto sync: set target (if changed) and poll until all nodes applied
+document.getElementById('btnAutoSync').onclick = async ()=>{
+  const btn = document.getElementById('btnAutoSync');
+  const input = document.getElementById('agentsTarget');
+  const val = (input.value || '').trim();
+  if(!val){ alert('لطفاً نسخه هدف را وارد کنید.'); return; }
+  const target = parseInt(val, 10);
+  if(isNaN(target) || target < 0){ alert('نسخه نامعتبر است.'); return; }
+  btn.disabled = true; btn.textContent = 'در حال همگام‌سازی...';
+  try{
+    // set version explicitly to ensure consistency
+    let needSet = true;
+    if(APP.cfg && APP.cfg.agents_version!=null){ needSet = parseInt(APP.cfg.agents_version) !== target; }
+    if(needSet){
+      const rr = await api('/v1/nodes/version', { method:'POST', body: JSON.stringify({ agents_version: target })});
+      if(!rr.ok){ const t = await rr.text(); throw new Error('خطا در تنظیم نسخه: ' + t); }
+      await loadConfig();
+    }
+    // poll nodes until all applied
+    const deadline = Date.now() + 8 * 60 * 1000; // 8 min
+    while(true){
+      await Promise.all([loadNodes(), loadConfig()]);
+      const r = await api('/v1/nodes');
+      const nodes = await r.json();
+      const now = Date.now()/1000;
+      const pending = nodes.filter(n => n.agents_version_applied !== target || !n.ts || (now - parseFloat(n.ts)) > 180);
+      const done = nodes.length - pending.length;
+      btn.textContent = `در حال همگام‌سازی... ${done}/${nodes.length}`;
+      if(pending.length === 0){
+        alert('همه نودها همگام شدند.');
+        break;
+      }
+      if(Date.now() > deadline){
+        const pendIps = pending.map(n => n.ip + (n.ts? '' : ' (بدون هارتبیت)')).join(', ');
+        alert('مهلت به پایان رسید. نودهای باقی‌مانده: ' + pendIps);
+        break;
+      }
+      await new Promise(res => setTimeout(res, 7000));
+    }
+  } catch(e){
+    alert(e?.message || e);
+  } finally {
+    btn.disabled = false; btn.textContent = 'همگام‌سازی خودکار';
   }
 };
 </script>
