@@ -12,7 +12,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -470,3 +470,32 @@ def self_update_controller():
         pass
 
     return {"ok": True, "restarting": True}
+
+
+@app.get("/v1/code/archive")
+def get_code_archive(repo: Optional[str] = None, branch: Optional[str] = None):
+    """Stream zip archive of the desired repo/branch to agents.
+    If repo/branch are not provided, use values from controller state.
+    """
+    with LOCK:
+        st = _load_state()
+        repo_url = repo or st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
+        br = branch or st.get("code_branch") or "main"
+    url = _github_zip_url(repo_url, br)
+    if not url:
+        raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
+
+    def _iter():
+        try:
+            with urlopen(url, timeout=45) as resp:
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception:
+            # propagate as empty stream to client; they'll handle failure
+            return
+
+    headers = {"Content-Disposition": f"attachment; filename=code-{br}.zip"}
+    return StreamingResponse(_iter(), media_type="application/zip", headers=headers)

@@ -59,15 +59,31 @@ def _github_zip_url(repo_url: str, branch: str):
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
-def update_code_from_repo(repo_url: str, branch: str, role: str):
+def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url: str = None):
     url = _github_zip_url(repo_url, branch)
     if not url:
         return False
     tmpdir = tempfile.mkdtemp(prefix="dns_loki_node_")
     zip_path = os.path.join(tmpdir, "src.zip")
     try:
-        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
-            shutil.copyfileobj(resp, f)
+        # try direct from GitHub first
+        try:
+            with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+        except Exception:
+            # fallback via controller proxy endpoint if available
+            if controller_url:
+                try:
+                    r = requests.get(f"{controller_url}/v1/code/archive", params={"repo": repo_url, "branch": branch}, timeout=45, stream=True)
+                    r.raise_for_status()
+                    with open(zip_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                except Exception:
+                    return False
+            else:
+                return False
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmpdir)
         root = None
@@ -322,14 +338,14 @@ def main():
         code_branch = conf.get("code_branch") or "main"
         agents_version_conf = int(conf.get("agents_version", 1))
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
-            if update_code_from_repo(code_repo, code_branch, role or ""):
+            if update_code_from_repo(code_repo, code_branch, role or "", controller_url):
                 try:
                     Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
                     Path(LAST_VER_FILE).write_text(str(agents_version_conf))
-                    # Reflect applied version in-memory to avoid repeated updates and report in heartbeat
-                    agents_version_applied = agents_version_conf
                 except Exception:
                     pass
+                # Reflect applied version in-memory regardless of disk write to avoid stalls
+                agents_version_applied = agents_version_conf
                 # restart self to load new code
                 try:
                     run("systemctl restart dns-proxy-agent", check=False)
