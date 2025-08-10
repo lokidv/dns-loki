@@ -9,7 +9,7 @@ import subprocess
 import time
 from urllib.request import urlopen
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -40,6 +40,14 @@ class Client(BaseModel):
 
 class Node(BaseModel):
     ip: IPvAnyAddress
+    role: str  # dns|proxy
+    enabled: bool = True
+    agents_version_applied: Optional[int] = None
+    ts: Optional[float] = None
+    diag: Optional[dict] = None
+
+class NodeIn(BaseModel):
+    ip: Optional[IPvAnyAddress] = None
     role: str  # dns|proxy
     enabled: bool = True
     agents_version_applied: Optional[int] = None
@@ -157,13 +165,22 @@ def list_nodes():
 
 
 @app.post("/v1/nodes", response_model=List[Node])
-def upsert_node(n: Node):
+def upsert_node(n: NodeIn, request: Request):
     with LOCK:
         st = _load_state()
-        n_payload = json.loads(n.json())  # ensure ip is string for JSON persistence
+        # Derive IP from payload or request if missing
+        ip_str = str(n.ip) if n.ip is not None else request.client.host
+        n_payload = {
+            "ip": ip_str,
+            "role": n.role,
+            "enabled": bool(n.enabled),
+            "agents_version_applied": n.agents_version_applied,
+            "ts": n.ts,
+            "diag": n.diag,
+        }
         found = False
         for x in st["nodes"]:
-            if str(x["ip"]) == str(n.ip):
+            if str(x["ip"]) == ip_str:
                 # Preserve existing values when incoming fields are None (avoid erasing)
                 old_diag = x.get("diag")
                 old_ver = x.get("agents_version_applied")

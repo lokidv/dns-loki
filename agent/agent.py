@@ -384,18 +384,18 @@ def main():
             },
         }
 
-        # Heartbeat / upsert node with diagnostics and version
+        # Heartbeat / upsert node with diagnostics and version (always send)
         try:
+            hb = {
+                "role": role,
+                "enabled": True,
+                "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
+                "ts": time.time(),
+                "diag": diag,
+            }
             if my_ip:
-                hb = {
-                    "ip": my_ip,
-                    "role": role,
-                    "enabled": True,
-                    "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
-                    "ts": time.time(),
-                    "diag": diag,
-                }
-                requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+                hb["ip"] = my_ip
+            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
         except Exception:
             pass
 
