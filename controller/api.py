@@ -51,7 +51,7 @@ class Node(BaseModel):
 class NodeIn(BaseModel):
     ip: Optional[IPvAnyAddress] = None
     role: str  # dns|proxy
-    enabled: bool = True
+    enabled: Optional[bool] = None
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
     diag: Optional[dict] = None
@@ -189,7 +189,6 @@ def upsert_node(n: NodeIn, request: Request):
         n_payload = {
             "ip": ip_str,
             "role": n.role,
-            "enabled": bool(n.enabled),
             "agents_version_applied": n.agents_version_applied,
             "ts": n.ts,
             "diag": n.diag,
@@ -227,6 +226,11 @@ def upsert_node(n: NodeIn, request: Request):
                 n_payload["agents_version_applied"] = 0
             if n_payload.get("diag") is None:
                 n_payload["diag"] = {}
+            # For a newly seen node, set enabled according to request if provided; otherwise default True
+            if n.enabled is None:
+                n_payload["enabled"] = True
+            else:
+                n_payload["enabled"] = bool(n.enabled)
             st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]
