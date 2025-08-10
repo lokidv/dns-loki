@@ -264,12 +264,13 @@ def main():
 
     domains_version_seen = None
     # track applied agents_version on disk to avoid loops across restarts
-    agents_version_applied = None
+    agents_version_applied = 0
     try:
         if Path(LAST_VER_FILE).exists():
             agents_version_applied = int(Path(LAST_VER_FILE).read_text().strip())
     except Exception:
-        agents_version_applied = None
+        # keep default 0 when unreadable
+        pass
     self_registered = False
     my_ip = None
 
@@ -390,12 +391,21 @@ def main():
             },
         }
 
+        # Refresh applied version from disk each loop (handles manual creation or post-start updates)
+        try:
+            if Path(LAST_VER_FILE).exists():
+                _cur = int(Path(LAST_VER_FILE).read_text().strip())
+                if agents_version_applied != _cur:
+                    agents_version_applied = _cur
+        except Exception:
+            pass
+
         # Heartbeat / upsert node with diagnostics and version (always send)
         try:
             hb = {
                 "role": role,
                 "enabled": True,
-                "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
+                "agents_version_applied": int(agents_version_applied),
                 "ts": time.time(),
                 "diag": diag,
             }

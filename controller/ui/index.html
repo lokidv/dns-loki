@@ -211,7 +211,14 @@ async function loadNodes(){
       const synced = (target!=null && n.agents_version_applied==target);
       if(age>180){ cls='err'; status='قطع ارتباط'; }
       else if(synced){ cls='ok'; status='همگام'; }
-      else { cls='warn'; status = (applied==='-')? 'نامشخص' : 'نیاز به آپدیت'; }
+      else {
+        cls='warn';
+        if(applied==='-'){
+          status = (target!=null) ? 'نیاز به آپدیت' : 'نامشخص';
+        } else {
+          status = 'نیاز به آپدیت';
+        }
+      }
     } else { cls='warn'; status='نامشخص'; }
     const tr = document.createElement('tr');
     tr.innerHTML = `
