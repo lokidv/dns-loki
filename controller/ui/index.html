@@ -305,6 +305,26 @@ async function loadNodes(){
             <b>targets.override</b><div>${targ.exists? 'بله' : 'خیر'} ${targ.size? `(${targ.size} B)` : ''}</div>
             <b>sniproxy.conf</b><div>${snic.exists? 'بله' : 'خیر'} ${snic.size? `(${snic.size} B)` : ''}</div>
           </div>
+          <div class="divider"></div>
+          <details>
+            <summary>ری‌استارت سرویس‌ها (SSH)</summary>
+            <div style="margin-top:8px; display:flex; flex-direction:column; gap:8px;">
+              <div class="grid-2">
+                <input class="rsUser" placeholder="ssh user (مثلاً root)" />
+                <input class="rsPass" placeholder="ssh password (اختیاری)" type="password" />
+              </div>
+              <textarea class="rsKey" placeholder="کلید خصوصی (اختیاری)" rows="4"></textarea>
+              <div class="chips" style="gap:12px;">
+                <label><input type="checkbox" class="rsAgent" checked /> Agent</label>
+                <label><input type="checkbox" class="rsCoreDNS" checked /> CoreDNS</label>
+                <label><input type="checkbox" class="rsSNI" checked /> SNI Proxy</label>
+              </div>
+              <div class="input-inline">
+                <button class="btn-restart">ری‌استارت</button>
+              </div>
+              <pre class="rsLog" style="white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--border); padding:10px; border-radius:10px; max-height:200px; overflow:auto;"></pre>
+            </div>
+          </details>
         </div>
       </td>
     `;
@@ -319,6 +339,48 @@ async function loadNodes(){
       const r = await api(path, { method:'POST' });
       if(!r.ok){ const t = await r.text(); alert('خطا در تغییر وضعیت نود: ' + t); return; }
       await loadNodes();
+    };
+    // restart services handler
+    const btnR = trd.querySelector('.btn-restart');
+    btnR.onclick = async () => {
+      const ip2 = encodeURIComponent(n.ip);
+      const user = (trd.querySelector('.rsUser').value || '').trim();
+      const pass = trd.querySelector('.rsPass').value;
+      const key = trd.querySelector('.rsKey').value;
+      const sAgent = trd.querySelector('.rsAgent').checked;
+      const sCore = trd.querySelector('.rsCoreDNS').checked;
+      const sSni = trd.querySelector('.rsSNI').checked;
+      const logEl = trd.querySelector('.rsLog');
+      logEl.textContent = '';
+      if(!user){ alert('Username الزامی است'); return; }
+      if(!pass && !key){ alert('لطفاً یکی از password یا key را وارد کنید'); return; }
+      const services = [];
+      if(sAgent) services.push('agent');
+      if(sCore) services.push('coredns');
+      if(sSni) services.push('sniproxy');
+      if(services.length===0){ alert('حداقل یک سرویس را انتخاب کنید'); return; }
+      const body = { ssh_user: user, services };
+      if(pass) body.ssh_password = pass;
+      if(key) body.ssh_key = key;
+      btnR.disabled = true; const oldTxt = btnR.textContent; btnR.textContent = 'در حال ری‌استارت...';
+      try{
+        const r = await api(`/v1/nodes/${ip2}/restart`, { method:'POST', body: JSON.stringify(body) });
+        const txt = await r.text();
+        if(!r.ok){
+          logEl.textContent = txt || 'خطای نامشخص';
+          alert('ری‌استارت ناموفق بود');
+          return;
+        }
+        let j = {};
+        try{ j = JSON.parse(txt); }catch(e){}
+        logEl.textContent = j.log || txt || 'OK';
+        // Optionally refresh node status
+        await loadNodes();
+      }catch(e){
+        logEl.textContent = (e?.message || e);
+      }finally{
+        btnR.disabled = false; btnR.textContent = oldTxt;
+      }
     };
   });
 }

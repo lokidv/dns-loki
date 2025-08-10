@@ -36,6 +36,26 @@ def log(msg: str):
         pass
 
 
+def ensure_docker_running() -> bool:
+    """اطمینان از آماده بودن Docker. اگر سرویس بالا نیست، تلاش برای start/enable.
+    خروجی True یعنی docker قابل استفاده است.
+    """
+    try:
+        res = run("docker version -f '{{.Server.Version}}'", check=False)
+        if res.returncode == 0 and (res.stdout or b""):
+            return True
+    except Exception:
+        pass
+    # تلاش برای بالا آوردن سرویس
+    log("docker: attempting to enable and start service")
+    run("systemctl enable --now docker", check=False)
+    time.sleep(1)
+    res2 = run("docker version -f '{{.Server.Version}}'", check=False)
+    ok = (res2.returncode == 0)
+    log(f"docker: availability after start -> rc={res2.returncode}")
+    return ok
+
+
 def ensure_git_repo(repo_url: str, branch: str):
     Path(DOMAINS_DIR).mkdir(parents=True, exist_ok=True)
     if not (Path(DOMAINS_DIR) / ".git").exists():
@@ -250,6 +270,14 @@ def render_sniproxy_conf(domains):
 def restart_sniproxy():
     # If container exists, try graceful reload first; otherwise ensure it's up
     log("sniproxy: restart requested")
+    # Ensure docker is available
+    if not ensure_docker_running():
+        log("sniproxy: docker not available; aborting restart for now")
+        return
+    # Check docker compose availability
+    has_compose = (run("docker compose version", check=False).returncode == 0)
+    if not has_compose:
+        log("sniproxy: 'docker compose' not available; will use direct 'docker run' fallback")
     ps = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml ps -q sniproxy", check=False)
     has_container = bool(ps.stdout and ps.stdout.strip())
     log(f"sniproxy: container present={has_container}")
@@ -262,19 +290,44 @@ def restart_sniproxy():
             return
         # Fallback to restart if HUP unsupported or container not running
         log("sniproxy: HUP failed; attempting restart")
-        res2 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
-        log(f"sniproxy: restart rc={res2.returncode}")
+        if has_compose:
+            res2 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
+            log(f"sniproxy: restart rc={res2.returncode}")
+        else:
+            # direct restart via docker if compose missing
+            res2 = run("docker restart sniproxy", check=False)
+            log(f"sniproxy: docker restart rc={res2.returncode}")
         return
     # No container yet -> bring it up
     log("sniproxy: container not found; bringing up with compose up -d")
-    res3 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml up -d sniproxy", check=False)
-    log(f"sniproxy: up -d rc={res3.returncode}")
+    if has_compose:
+        res3 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml up -d sniproxy", check=False)
+        log(f"sniproxy: up -d rc={res3.returncode}")
+        if res3.returncode == 0:
+            return
+        log("sniproxy: compose up failed; trying direct docker run")
+    # Fallback: direct docker run (host network)
+    run("docker rm -f sniproxy", check=False)
+    cmd = (
+        f"docker run -d --name sniproxy --restart unless-stopped --network host "
+        f"-v {DEF_PROXY_DIR}/sniproxy.conf:/etc/sniproxy.conf "
+        f"lancachenet/sniproxy:latest /usr/sbin/sniproxy -f -c /etc/sniproxy.conf"
+    )
+    res4 = run(cmd, check=False)
+    log(f"sniproxy: docker run rc={res4.returncode}")
 
 
 def _is_container_running(compose_file: str, service: str) -> bool:
     try:
         res = run(f"docker compose -f {compose_file} ps -q {service}", check=False)
         if res.returncode == 0 and res.stdout and res.stdout.strip():
+            return True
+    except Exception:
+        pass
+    # Fallback to plain docker in case compose is unavailable
+    try:
+        res2 = run(f"docker ps -q --filter name=^{service}$ --filter status=running", check=False)
+        if res2.returncode == 0 and res2.stdout and res2.stdout.strip():
             return True
     except Exception:
         pass
@@ -498,12 +551,19 @@ def main():
             old = out_path.read_text() if out_path.exists() else ""
             if conf_txt != old:
                 out_path.write_text(conf_txt)
-                restart_sniproxy()
+                # Ensure docker is up before attempting restart
+                if ensure_docker_running():
+                    restart_sniproxy()
+                else:
+                    log("sniproxy: postponed start; docker not ready")
             else:
                 # Ensure sniproxy is up even if config didn't change (e.g., docker installed later)
                 if not _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy"):
                     log("sniproxy: not running; attempting to start")
-                    restart_sniproxy()
+                    if ensure_docker_running():
+                        restart_sniproxy()
+                    else:
+                        log("sniproxy: start skipped; docker not ready")
 
         # Build diagnostics after applying configs
         diag = {
