@@ -185,10 +185,25 @@ def upsert_node(n: NodeIn, request: Request):
                 old_diag = x.get("diag")
                 old_ver = x.get("agents_version_applied")
                 x.update(n_payload)
+                # Restore diag if missing in payload
                 if x.get("diag") is None and old_diag is not None:
                     x["diag"] = old_diag
-                if x.get("agents_version_applied") is None and old_ver is not None:
-                    x["agents_version_applied"] = old_ver
+                # Do not let agents_version_applied decrease due to stale heartbeats
+                incoming_ver = n_payload.get("agents_version_applied")
+                if incoming_ver is None:
+                    # keep previous when payload omits the field
+                    if old_ver is not None:
+                        x["agents_version_applied"] = old_ver
+                else:
+                    try:
+                        old_i = int(old_ver) if old_ver is not None else 0
+                    except Exception:
+                        old_i = 0
+                    try:
+                        inc_i = int(incoming_ver)
+                    except Exception:
+                        inc_i = old_i
+                    x["agents_version_applied"] = max(old_i, inc_i)
                 found = True
         if not found:
             # Defaults for new node records to avoid nulls in UI/state
