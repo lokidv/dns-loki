@@ -191,6 +191,11 @@ def upsert_node(n: NodeIn, request: Request):
                     x["agents_version_applied"] = old_ver
                 found = True
         if not found:
+            # Defaults for new node records to avoid nulls in UI/state
+            if n_payload.get("agents_version_applied") is None:
+                n_payload["agents_version_applied"] = 0
+            if n_payload.get("diag") is None:
+                n_payload["diag"] = {}
             st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]

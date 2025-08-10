@@ -17,11 +17,23 @@ DEF_PROXY_DIR = "/opt/dns-proxy/docker/proxy"
 WORK_DIR = "/opt/dns-proxy"
 DOMAINS_DIR = f"{WORK_DIR}/domains"
 LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
+LOG_FILE = f"{WORK_DIR}/agent/agent.log"
 
 
 def run(cmd, check=True):
     # print("RUN:", cmd)
     return subprocess.run(cmd, shell=True, check=check, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def log(msg: str):
+    try:
+        Path(f"{WORK_DIR}/agent").mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        # never raise from logging
+        pass
 
 
 def ensure_git_repo(repo_url: str, branch: str):
@@ -62,18 +74,21 @@ def _github_zip_url(repo_url: str, branch: str):
 def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url: str = None):
     url = _github_zip_url(repo_url, branch)
     if not url:
+        log(f"update: invalid repo url -> repo={repo_url!r} branch={branch!r}")
         return False
     tmpdir = tempfile.mkdtemp(prefix="dns_loki_node_")
     zip_path = os.path.join(tmpdir, "src.zip")
     try:
         # try direct from GitHub first
         try:
+            log(f"update: downloading from GitHub codeload -> {url}")
             with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
         except Exception:
             # fallback via controller proxy endpoint if available
             if controller_url:
                 try:
+                    log(f"update: GitHub direct failed; trying controller proxy {controller_url}/v1/code/archive")
                     r = requests.get(f"{controller_url}/v1/code/archive", params={"repo": repo_url, "branch": branch}, timeout=45, stream=True)
                     r.raise_for_status()
                     with open(zip_path, "wb") as f:
@@ -81,9 +96,12 @@ def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url:
                             if chunk:
                                 f.write(chunk)
                 except Exception:
+                    log("update: controller proxy download failed")
                     return False
             else:
+                log("update: GitHub download failed and no controller_url provided for fallback")
                 return False
+        log("update: download ok; extracting zip")
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmpdir)
         root = None
@@ -104,6 +122,7 @@ def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url:
                     root = p
                     break
         if not root:
+            log("update: could not detect source root after extraction")
             return False
         # Ensure destination directories exist
         Path(f"{WORK_DIR}/agent").mkdir(parents=True, exist_ok=True)
@@ -129,11 +148,13 @@ def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url:
                     shutil.copy2(tmpl, f"{WORK_DIR}/docker/proxy/sniproxy.conf.tmpl")
         # Reinstall agent deps (best-effort)
         try:
+            log("update: installing/upgrading agent requirements (best-effort)")
             run(f"{WORK_DIR}/agent/venv/bin/pip install -r {WORK_DIR}/agent/requirements.txt", check=False)
         except Exception:
-            pass
+            log("update: pip install step failed (ignored)")
         return True
     finally:
+        log("update: cleanup temp directory")
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -144,6 +165,7 @@ def read_domains_list():
     lines = [l.strip() for l in path.read_text(encoding='utf-8').splitlines()]
     domains = [l for l in lines if l and not l.startswith('#')]
     return domains
+
 
 def fetch_domains_from_api(controller_url: str):
     try:
@@ -306,16 +328,20 @@ def main():
     try:
         if Path(LAST_VER_FILE).exists():
             agents_version_applied = int(Path(LAST_VER_FILE).read_text().strip())
-    except Exception:
+            log(f"init: last_agents_version found -> {agents_version_applied}")
+        else:
+            log("init: last_agents_version not found; default 0")
+    except Exception as e:
         # keep default 0 when unreadable
-        pass
+        log(f"init: failed reading last_agents_version -> {e}")
     self_registered = False
     my_ip = None
 
     while True:
         try:
             conf = requests.get(f"{controller_url}/v1/config", timeout=5).json()
-        except Exception:
+        except Exception as e:
+            log(f"loop: failed fetching controller config -> {e}")
             time.sleep(5)
             continue
 
@@ -338,20 +364,25 @@ def main():
         code_branch = conf.get("code_branch") or "main"
         agents_version_conf = int(conf.get("agents_version", 1))
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
+            log(f"update-check: target={agents_version_conf} applied={agents_version_applied} repo={code_repo} branch={code_branch}")
             if update_code_from_repo(code_repo, code_branch, role or "", controller_url):
                 try:
                     Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
                     Path(LAST_VER_FILE).write_text(str(agents_version_conf))
-                except Exception:
-                    pass
+                    log(f"update-apply: wrote last_agents_version={agents_version_conf}")
+                except Exception as e:
+                    log(f"update-apply: failed writing last_agents_version -> {e}")
                 # Reflect applied version in-memory regardless of disk write to avoid stalls
                 agents_version_applied = agents_version_conf
                 # restart self to load new code
                 try:
+                    log("update-apply: restarting service dns-proxy-agent")
                     run("systemctl restart dns-proxy-agent", check=False)
                     time.sleep(2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"update-apply: restart failed -> {e}")
+            else:
+                log("update-check: update_code_from_repo returned False (will retry)")
 
         # Sync domains based on source of truth
         domains = []
@@ -434,9 +465,10 @@ def main():
             if Path(LAST_VER_FILE).exists():
                 _cur = int(Path(LAST_VER_FILE).read_text().strip())
                 if agents_version_applied != _cur:
+                    log(f"loop: detected last_agents_version change on disk -> {_cur}")
                     agents_version_applied = _cur
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"loop: failed reading last_agents_version -> {e}")
 
         # Heartbeat / upsert node with diagnostics and version (always send)
         try:
@@ -450,8 +482,8 @@ def main():
             if my_ip:
                 hb["ip"] = my_ip
             requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"heartbeat: failed to post -> {e}")
 
         time.sleep(cfg.get("health_check_interval_seconds", 10))
 
