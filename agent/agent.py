@@ -67,6 +67,10 @@ def update_code_from_repo(repo_url: str, branch: str, role: str):
                 break
         if not root:
             return False
+        # Ensure destination directories exist
+        Path(f"{WORK_DIR}/agent").mkdir(parents=True, exist_ok=True)
+        Path(f"{WORK_DIR}/docker/dns").mkdir(parents=True, exist_ok=True)
+        Path(f"{WORK_DIR}/docker/proxy").mkdir(parents=True, exist_ok=True)
         # Always update agent code
         shutil.copy2(os.path.join(root, "agent", "agent.py"), f"{WORK_DIR}/agent/agent.py")
         if os.path.exists(os.path.join(root, "agent", "requirements.txt")):
