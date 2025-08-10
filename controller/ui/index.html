@@ -45,6 +45,9 @@
     .input-inline{ display:flex; gap:8px; }
     .divider{ height:1px; background: var(--border); margin: 10px 0; }
     .count{ font-size:12px; color:var(--muted); }
+    .details{ background: var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:10px; }
+    .kv{ display:grid; grid-template-columns: 160px 1fr; gap:6px 10px; font-size:13px; }
+    .kv b{ color:var(--muted); font-weight:600; }
   </style>
 </head>
 <body>
@@ -121,6 +124,7 @@
             <th>وضعیت</th>
             <th>آخرین اتصال</th>
             <th>فعال</th>
+            <th>جزئیات/عملیات</th>
           </tr>
         </thead>
         <tbody id="nodes"></tbody>
@@ -218,8 +222,55 @@ async function loadNodes(){
       <td><span class="status ${cls}">${status}</span></td>
       <td>${ts? fmtAgo(ts): '—'}</td>
       <td>${n.enabled ? '<span class="status ok">فعال</span>' : '<span class="status err">غیرفعال</span>'}</td>
+      <td>
+        <div class="input-inline" style="gap:6px;">
+          <button class="btn-details">جزئیات</button>
+          <button class="btn-toggle">${n.enabled ? 'غیرفعال' : 'فعال'}</button>
+        </div>
+      </td>
+    `;
+    // build details row (structured)
+    const d = n.diag || {};
+    const svc = d.svc || {};
+    const files = d.files || {};
+    const healthy = (d.proxies_healthy!=null? d.proxies_healthy : 0);
+    const total = (d.proxies_total!=null? d.proxies_total : 0);
+    const coreRun = svc.coredns_running===true ? '<span class="status ok">روشن</span>' : (svc.coredns_running===false ? '<span class="status err">خاموش</span>' : '—');
+    const sniRun = svc.sniproxy_running===true ? '<span class="status ok">روشن</span>' : (svc.sniproxy_running===false ? '<span class="status err">خاموش</span>' : '—');
+    const targ = files.targets_override || {};
+    const snic = files.sniproxy_conf || {};
+
+    const trd = document.createElement('tr');
+    trd.style.display = 'none';
+    trd.innerHTML = `
+      <td colspan="8">
+        <div class="details">
+          <div class="kv">
+            <b>نقش</b><div>${d.role || n.role || '—'}</div>
+            <b>تعداد دامنه‌ها</b><div>${d.domains_count ?? '—'}</div>
+            <b>پروکسی سالم/کل</b><div>${healthy}/${total}</div>
+            <b>DNS enforce</b><div>${d.enforce_dns===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
+            <b>Proxy enforce</b><div>${d.enforce_proxy===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
+            <b>CoreDNS</b><div>${coreRun}</div>
+            <b>SNI Proxy</b><div>${sniRun}</div>
+            <b>targets.override</b><div>${targ.exists? 'بله' : 'خیر'} ${targ.size? `(${targ.size} B)` : ''}</div>
+            <b>sniproxy.conf</b><div>${snic.exists? 'بله' : 'خیر'} ${snic.size? `(${snic.size} B)` : ''}</div>
+          </div>
+        </div>
+      </td>
     `;
     el.appendChild(tr);
+    el.appendChild(trd);
+    tr.querySelector('.btn-details').onclick = () => {
+      trd.style.display = (trd.style.display==='none') ? 'table-row' : 'none';
+    };
+    tr.querySelector('.btn-toggle').onclick = async () => {
+      const ip = encodeURIComponent(n.ip);
+      const path = n.enabled ? `/v1/nodes/${ip}/disable` : `/v1/nodes/${ip}/enable`;
+      const r = await api(path, { method:'POST' });
+      if(!r.ok){ const t = await r.text(); alert('خطا در تغییر وضعیت نود: ' + t); return; }
+      await loadNodes();
+    };
   });
 }
 

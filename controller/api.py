@@ -44,6 +44,7 @@ class Node(BaseModel):
     enabled: bool = True
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
+    diag: Optional[dict] = None
 
 class ConfigOut(BaseModel):
     clients: List[Client]

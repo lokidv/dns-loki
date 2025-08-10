@@ -191,6 +191,16 @@ def restart_sniproxy():
         run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
 
 
+def _is_container_running(compose_file: str, service: str) -> bool:
+    try:
+        res = run(f"docker compose -f {compose_file} ps -q {service}", check=False)
+        if res.returncode == 0 and res.stdout and res.stdout.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def nft_ensure_set(set_name: str):
     # Ensure a named set exists; create if missing
     res = run(f"nft list set inet filter {set_name}", check=False)
@@ -274,20 +284,6 @@ def main():
             except Exception:
                 my_ip = None
 
-        # Heartbeat / upsert node each loop with version and timestamp
-        try:
-            if my_ip:
-                hb = {
-                    "ip": my_ip,
-                    "role": role,
-                    "enabled": True,
-                    "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
-                    "ts": time.time(),
-                }
-                requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
-        except Exception:
-            pass
-
         clients = [c["ip"] for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns","proxy"]) ]
         proxies = [n for n in conf.get("nodes", []) if n.get("role") == "proxy" and n.get("enabled", True)]
         proxy_ips = [str(n["ip"]) for n in proxies]
@@ -329,6 +325,7 @@ def main():
         if not domains:
             domains = ["amd.com", "*.amd.com"]
 
+        healthy = []
         if role == "dns":
             apply_dns_policy(enforce_dns)
             # Update nft set of allowed dns clients
@@ -336,7 +333,6 @@ def main():
                 nft_replace_set("allow_dns_clients", clients)
             # Health check proxies
             sni_host = domains[0].lstrip("*.")
-            healthy = []
             for ip in proxy_ips:
                 if tls_health_check(ip, sni_host):
                     healthy.append(ip)
@@ -363,6 +359,45 @@ def main():
             if conf_txt != old:
                 out_path.write_text(conf_txt)
                 restart_sniproxy()
+
+        # Build diagnostics after applying configs
+        diag = {
+            "role": role,
+            "domains_count": len(domains),
+            "proxies_total": len(proxy_ips),
+            "proxies_healthy": len(healthy) if healthy else 0,
+            "enforce_dns": bool(enforce_dns),
+            "enforce_proxy": bool(enforce_proxy),
+            "svc": {
+                "coredns_running": _is_container_running(f"{DEF_CORE_DNS_DIR}/docker-compose.yml", "coredns") if role == "dns" else None,
+                "sniproxy_running": _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy") if role == "proxy" else None,
+            },
+            "files": {
+                "targets_override": {
+                    "exists": Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists(),
+                    "size": (Path(f"{DEF_CORE_DNS_DIR}/targets.override").stat().st_size if Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists() else 0),
+                },
+                "sniproxy_conf": {
+                    "exists": Path(f"{DEF_PROXY_DIR}/sniproxy.conf").exists(),
+                    "size": (Path(f"{DEF_PROXY_DIR}/sniproxy.conf").stat().st_size if Path(f"{DEF_PROXY_DIR}/sniproxy.conf").exists() else 0),
+                },
+            },
+        }
+
+        # Heartbeat / upsert node with diagnostics and version
+        try:
+            if my_ip:
+                hb = {
+                    "ip": my_ip,
+                    "role": role,
+                    "enabled": True,
+                    "agents_version_applied": int(agents_version_applied) if agents_version_applied is not None else None,
+                    "ts": time.time(),
+                    "diag": diag,
+                }
+                requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+        except Exception:
+            pass
 
         time.sleep(cfg.get("health_check_interval_seconds", 10))
 
