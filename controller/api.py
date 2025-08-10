@@ -386,9 +386,23 @@ def update_nodes(settings: CodeSettings = None):
             st["code_repo"] = settings.code_repo
         if settings and settings.code_branch is not None:
             st["code_branch"] = settings.code_branch
-        st["agents_version"] = int(st.get("agents_version", 1)) + 1
+        # Bump applied version for all nodes by 1 (do not change target agents_version)
+        updated = 0
+        for node in st.get("nodes", []):
+            cur = node.get("agents_version_applied")
+            try:
+                cur_i = int(cur) if cur is not None else 0
+            except Exception:
+                cur_i = 0
+            node["agents_version_applied"] = cur_i + 1
+            updated += 1
         _save_state(st)
-        return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
+        return {
+            "updated_nodes": updated,
+            "agents_version": st.get("agents_version", 1),
+            "code_repo": st["code_repo"],
+            "code_branch": st["code_branch"],
+        }
 
 
 @app.post("/v1/nodes/version")
