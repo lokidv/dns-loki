@@ -316,14 +316,36 @@ if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get install -y docker.io docker-compose-plugin || true
   fi
   # Ensure docker service is running on apt-based systems
+  # Try enabling docker if present; otherwise fallback to official install script
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[+] installing Docker via get.docker.com fallback"
+    curl -fsSL https://get.docker.com | sudo sh
+  fi
   sudo systemctl enable --now docker || true
+  # Ensure docker compose availability (plugin or manual CLI plugin)
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "[+] installing docker compose CLI plugin manually"
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -SL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
 elif command -v dnf >/dev/null 2>&1; then
   sudo dnf install -y python3 python3-venv curl unzip ca-certificates
   sudo dnf install -y docker docker-compose || true
   sudo systemctl enable --now docker || true
+  # Ensure docker compose availability; if missing, install CLI plugin manually
+  if ! docker compose version >/dev/null 2>&1; then
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -SL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
 else
   echo "Unsupported package manager; install python3, venv, docker manually" >&2
 fi
+
+echo "[+] verifying docker and compose versions"
+docker --version || true
+docker compose version || true
 
 echo "[+] fetching initial code archive from controller"
 TMPDIR=$(mktemp -d)

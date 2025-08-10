@@ -499,6 +499,11 @@ def main():
             if conf_txt != old:
                 out_path.write_text(conf_txt)
                 restart_sniproxy()
+            else:
+                # Ensure sniproxy is up even if config didn't change (e.g., docker installed later)
+                if not _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy"):
+                    log("sniproxy: not running; attempting to start")
+                    restart_sniproxy()
 
         # Build diagnostics after applying configs
         diag = {
