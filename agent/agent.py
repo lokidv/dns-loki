@@ -299,6 +299,8 @@ def main():
                 try:
                     Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
                     Path(LAST_VER_FILE).write_text(str(agents_version_conf))
+                    # Reflect applied version in-memory to avoid repeated updates and report in heartbeat
+                    agents_version_applied = agents_version_conf
                 except Exception:
                     pass
                 # restart self to load new code
