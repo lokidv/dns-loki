@@ -41,78 +41,30 @@ def ensure_git_repo(repo_url: str, branch: str):
 
 
 def _github_zip_url(repo_url: str, branch: str):
-    # پشتیبانی از حالت‌های متداول URL گیت‌هاب:
-    # - https://github.com/owner/repo.git
-    # - https://github.com/owner/repo
-    # - http://github.com/owner/repo(.git)
-    # - git@github.com:owner/repo(.git)
-    if not repo_url:
+    m = re.search(r"github\\.com/([^/]+)/([^/.]+)", repo_url)
+    if not m:
         return None
-    s = repo_url.strip()
-    # حالت SSH مانند git@github.com:owner/repo(.git)
-    m_ssh = re.match(r"git@github\.com:([^/]+)/([^/]+)(?:\.git)?$", s)
-    if m_ssh:
-        owner, repo = m_ssh.group(1), m_ssh.group(2)
-        return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
-    # حالت‌های http/https با/بدون www و با/بدون .git
-    m_http = re.search(r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)", s)
-    if not m_http:
-        return None
-    owner, repo = m_http.group(1), m_http.group(2)
-    repo = repo[:-4] if repo.endswith('.git') else repo
+    owner, repo = m.group(1), m.group(2)
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
-def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url: str = None):
+def update_code_from_repo(repo_url: str, branch: str, role: str):
     url = _github_zip_url(repo_url, branch)
+    if not url:
+        return False
     tmpdir = tempfile.mkdtemp(prefix="dns_loki_node_")
     zip_path = os.path.join(tmpdir, "src.zip")
     try:
+        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmpdir)
         root = None
-        zip_ok = False
-        # اولویت: دریافت باندل از کنترلر
-        if controller_url:
-            try:
-                import requests as _rq
-                r = _rq.get(f"{controller_url}/v1/code/bundle", timeout=30, stream=True)
-                if r.ok:
-                    with open(zip_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    with zipfile.ZipFile(zip_path) as zf:
-                        zf.extractall(tmpdir)
-                    zip_ok = True
-            except Exception:
-                zip_ok = False
-        # در صورت عدم موفقیت، مستقیماً از گیت‌هاب دریافت می‌کنیم
-        if not zip_ok and url:
-            try:
-                with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
-                with zipfile.ZipFile(zip_path) as zf:
-                    zf.extractall(tmpdir)
-                zip_ok = True
-            except Exception:
-                zip_ok = False
-        if zip_ok:
-            # یافتن ریشه سورس استخراج‌شده (مقاوم نسبت به نام ریپو)
-            for name in os.listdir(tmpdir):
-                p = os.path.join(tmpdir, name)
-                if os.path.isdir(p):
-                    # ترجیح: دایرکتوری که agent/agent.py را دارد
-                    if os.path.exists(os.path.join(p, "agent", "agent.py")):
-                        root = p
-                        break
-                    # fallback: اولین دایرکتوری
-                    if root is None:
-                        root = p
-        else:
-            # fallback: استفاده از git clone
-            clone_dir = os.path.join(tmpdir, "repo")
-            res = run(f"git clone -b {branch} {repo_url} {clone_dir}", check=False)
-            if res.returncode == 0 and os.path.isdir(clone_dir):
-                root = clone_dir
+        for name in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, name)
+            if os.path.isdir(p) and name.startswith("dns-loki-"):
+                root = p
+                break
         if not root:
             return False
         # Ensure destination directories exist
@@ -348,25 +300,12 @@ def main():
         code_branch = conf.get("code_branch") or "main"
         agents_version_conf = int(conf.get("agents_version", 1))
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
-            if update_code_from_repo(code_repo, code_branch, role or "", controller_url):
+            if update_code_from_repo(code_repo, code_branch, role or ""):
                 try:
                     Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
                     Path(LAST_VER_FILE).write_text(str(agents_version_conf))
                     # Reflect applied version in-memory to avoid repeated updates and report in heartbeat
                     agents_version_applied = agents_version_conf
-                except Exception:
-                    pass
-                # ارسال هارتبیت فوری قبل از ری‌استارت تا نسخه جدید در UI دیده شود
-                try:
-                    hb = {
-                        "role": role,
-                        "enabled": True,
-                        "agents_version_applied": int(agents_version_applied),
-                        "ts": time.time(),
-                        "diag": None,
-                    }
-                    requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=3)
-                    time.sleep(0.3)
                 except Exception:
                     pass
                 # restart self to load new code

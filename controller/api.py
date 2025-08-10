@@ -12,7 +12,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -349,33 +349,6 @@ def _github_zip_url(repo_url: str, branch: str) -> Optional[str]:
     owner, repo = m_http.group(1), m_http.group(2)
     repo = repo[:-4] if repo.endswith('.git') else repo
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
-
-
-@app.get("/v1/code/bundle")
-def code_bundle():
-    """Stream zip bundle of the configured code_repo/code_branch for Agents to pull via Controller."""
-    with LOCK:
-        st = _load_state()
-        repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
-        branch = st.get("code_branch") or "main"
-    url = _github_zip_url(repo, branch)
-    if not url:
-        raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
-
-    def iterfile():
-        try:
-            with urlopen(url, timeout=30) as resp:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-        except Exception:
-            # Propagate as empty generator; FastAPI will raise on first iteration
-            raise HTTPException(status_code=502, detail="failed to fetch bundle from upstream")
-
-    headers = {"Content-Disposition": f'attachment; filename="code-{branch}.zip"'}
-    return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
 
 
 def _copy_tree(src: str, dst: str):
