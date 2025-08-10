@@ -365,24 +365,47 @@ def main():
         agents_version_conf = int(conf.get("agents_version", 1))
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
             log(f"update-check: target={agents_version_conf} applied={agents_version_applied} repo={code_repo} branch={code_branch}")
-            if update_code_from_repo(code_repo, code_branch, role or "", controller_url):
+            try:
+                update_success = update_code_from_repo(code_repo, code_branch, role or "", controller_url)
+                log(f"update-check: update_code_from_repo returned {update_success}")
+                if update_success:
+                    try:
+                        Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
+                        Path(LAST_VER_FILE).write_text(str(agents_version_conf))
+                        log(f"update-apply: wrote last_agents_version={agents_version_conf}")
+                    except Exception as e:
+                        log(f"update-apply: failed writing last_agents_version -> {e}")
+                    # Reflect applied version in-memory regardless of disk write to avoid stalls
+                    agents_version_applied = agents_version_conf
+                    log(f"update-apply: updated agents_version_applied to {agents_version_applied}")
+                    
+                    # Report success to controller
+                    try:
+                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
+                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                        log(f"update-apply: reported success to controller")
+                    except Exception as e:
+                        log(f"update-apply: failed reporting to controller -> {e}")
+                    
+                    # restart self to load new code
+                    try:
+                        log("update-apply: restarting service dns-proxy-agent")
+                        run("systemctl restart dns-proxy-agent", check=False)
+                        time.sleep(2)
+                    except Exception as e:
+                        log(f"update-apply: restart failed -> {e}")
+                else:
+                    log("update-check: update_code_from_repo failed, will retry next cycle")
+            except Exception as e:
+                log(f"update-check: exception during update process -> {e}")
+        else:
+            # Versions match - still report to controller periodically
+            if my_ip and agents_version_applied > 0:
                 try:
-                    Path(LAST_VER_FILE).parent.mkdir(parents=True, exist_ok=True)
-                    Path(LAST_VER_FILE).write_text(str(agents_version_conf))
-                    log(f"update-apply: wrote last_agents_version={agents_version_conf}")
-                except Exception as e:
-                    log(f"update-apply: failed writing last_agents_version -> {e}")
-                # Reflect applied version in-memory regardless of disk write to avoid stalls
-                agents_version_applied = agents_version_conf
-                # restart self to load new code
-                try:
-                    log("update-apply: restarting service dns-proxy-agent")
-                    run("systemctl restart dns-proxy-agent", check=False)
-                    time.sleep(2)
-                except Exception as e:
-                    log(f"update-apply: restart failed -> {e}")
-            else:
-                log("update-check: update_code_from_repo returned False (will retry)")
+                    report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
+                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                except Exception:
+                    pass  # Silent fail for periodic reports
 
         # Sync domains based on source of truth
         domains = []
