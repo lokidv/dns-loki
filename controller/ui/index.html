@@ -140,6 +140,28 @@
       </table>
     </div>
   </div>
+
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-12">
+      <h2>پروویژن پروکسی (SSH)</h2>
+      <div class="muted">با وارد کردن اطلاعات اتصال، سرور به عنوان پروکسی تنظیم و Agent نصب می‌شود.</div>
+      <div class="grid-2" style="margin-top:8px;">
+        <div class="input-inline" style="gap:8px; flex-wrap:wrap;">
+          <input id="pxIp" placeholder="IP" style="min-width:160px;" />
+          <input id="pxUser" placeholder="SSH Username" style="min-width:160px;" />
+          <input id="pxPass" placeholder="SSH Password (اختیاری)" type="password" style="min-width:200px;" />
+          <textarea id="pxKey" placeholder="SSH Private Key (اختیاری)" rows="3" style="min-width:320px; width:100%;"></textarea>
+        </div>
+        <div class="input-inline" style="justify-content:flex-end; gap:8px;">
+          <button id="btnProvision" class="btn-primary">Provision</button>
+        </div>
+      </div>
+      <details style="margin-top:10px;">
+        <summary>لاگ عملیات</summary>
+        <pre id="provLog" style="white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--border); padding:10px; border-radius:10px; max-height:260px; overflow:auto;"></pre>
+      </details>
+    </div>
+  </div>
   </div>
 
 <script>
@@ -257,6 +279,13 @@ async function loadNodes(){
     const sniRun = svc.sniproxy_running===true ? '<span class="status ok">روشن</span>' : (svc.sniproxy_running===false ? '<span class="status err">خاموش</span>' : '—');
     const targ = files.targets_override || {};
     const snic = files.sniproxy_conf || {};
+    const selLat = (d.selected_latency_ms!=null) ? (Math.round(d.selected_latency_ms) + ' ms') : null;
+    let latmap = '';
+    if(d.proxies_latency_ms && typeof d.proxies_latency_ms === 'object'){
+      try{
+        latmap = Object.entries(d.proxies_latency_ms).map(([ip,v])=> ip + ': ' + Math.round(v) + ' ms').join(', ');
+      }catch(_){ latmap = ''; }
+    }
 
     const trd = document.createElement('tr');
     trd.style.display = 'none';
@@ -267,6 +296,8 @@ async function loadNodes(){
             <b>نقش</b><div>${d.role || n.role || '—'}</div>
             <b>تعداد دامنه‌ها</b><div>${d.domains_count ?? '—'}</div>
             <b>پروکسی سالم/کل</b><div>${healthy}/${total}</div>
+            <b>پروکسی منتخب</b><div>${d.selected_proxy ? (d.selected_proxy + (selLat? ' ('+selLat+')' : '')) : '—'}</div>
+            <b>Latencyها</b><div>${latmap || '—'}</div>
             <b>DNS enforce</b><div>${d.enforce_dns===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
             <b>Proxy enforce</b><div>${d.enforce_proxy===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
             <b>CoreDNS</b><div>${coreRun}</div>
@@ -399,6 +430,35 @@ document.getElementById('btnSetAgentsVersion').onclick = async ()=>{
   await loadConfig();
   await loadNodes();
   alert('نسخه هدف تنظیم شد.');
+};
+
+// proxy provision
+document.getElementById('btnProvision').onclick = async ()=>{
+  const ip = document.getElementById('pxIp').value.trim();
+  const user = document.getElementById('pxUser').value.trim();
+  const pass = document.getElementById('pxPass').value;
+  const key = document.getElementById('pxKey').value;
+  const logEl = document.getElementById('provLog');
+  logEl.textContent = '';
+  if(!ip || !user){ alert('IP و Username الزامی هستند'); return; }
+  const body = { ip, ssh_user: user };
+  if(pass) body.ssh_password = pass;
+  if(key) body.ssh_key = key;
+  try{
+    const r = await api('/v1/proxies/provision', { method:'POST', body: JSON.stringify(body) });
+    const txt = await r.text();
+    if(!r.ok){
+      logEl.textContent = txt || 'خطای نامشخص';
+      alert('پروویژن ناموفق بود');
+      return;
+    }
+    let j = {};
+    try{ j = JSON.parse(txt); }catch(e){}
+    logEl.textContent = j.log || txt || 'OK';
+    await Promise.all([loadConfig(), loadNodes()]);
+  }catch(e){
+    logEl.textContent = (e?.message || e);
+  }
 };
 
 // Force Reset all agents

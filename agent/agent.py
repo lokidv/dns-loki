@@ -311,6 +311,26 @@ def tls_health_check(ip: str, sni_host: str, timeout=3.0) -> bool:
         return False
 
 
+def tls_probe_latency(ip: str, sni_host: str, timeout=3.0):
+    """انجام هندشیک TLS و ارسال یک درخواست HEAD کوچک برای سنجش تاخیر.
+    خروجی: (ok: bool, latency_ms: float|None)
+    """
+    import socket, ssl
+    t0 = time.perf_counter()
+    try:
+        ctx = ssl.create_default_context()
+        sock = socket.create_connection((ip, 443), timeout=timeout)
+        ssock = ctx.wrap_socket(sock, server_hostname=sni_host)
+        req = f"HEAD / HTTP/1.1\r\nHost: {sni_host}\r\nConnection: close\r\n\r\n"
+        ssock.send(req.encode())
+        _ = ssock.recv(1)
+        ssock.close()
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        return True, dt_ms
+    except Exception:
+        return False, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -432,14 +452,19 @@ def main():
                 nft_replace_set("allow_dns_clients", clients)
             # Health check proxies
             sni_host = domains[0].lstrip("*.")
+            lat_map = {}
+            best_ip, best_lat = None, None
             for ip in proxy_ips:
-                if tls_health_check(ip, sni_host):
+                ok, lat = tls_probe_latency(ip, sni_host, timeout=3.0)
+                if ok:
                     healthy.append(ip)
-            # Fallback: if none healthy, use all to avoid total outage
-            if not healthy:
-                healthy = proxy_ips
+                    lat_map[ip] = lat
+                    if best_lat is None or lat < best_lat:
+                        best_lat, best_ip = lat, ip
+            # Fallback: اگر سالمی نبود، همه را استفاده کن
+            selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
             # Render CoreDNS override files
-            targets = render_coredns_targets(domains, healthy)
+            targets = render_coredns_targets(domains, selected)
             v6blk = render_v6block(domains)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
@@ -465,6 +490,9 @@ def main():
             "domains_count": len(domains),
             "proxies_total": len(proxy_ips),
             "proxies_healthy": len(healthy) if healthy else 0,
+            "selected_proxy": (best_ip if role == "dns" else None),
+            "selected_latency_ms": (round(best_lat, 1) if (role == "dns" and best_lat is not None) else None),
+            "proxies_latency_ms": (lat_map if role == "dns" else None),
             "enforce_dns": bool(enforce_dns),
             "enforce_proxy": bool(enforce_proxy),
             "svc": {

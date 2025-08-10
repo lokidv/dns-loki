@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
+import io
+import paramiko
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -71,6 +73,14 @@ class DomainsPayload(BaseModel):
 
 class DomainItem(BaseModel):
     domain: str
+
+
+class ProvisionRequest(BaseModel):
+    ip: str
+    ssh_user: str
+    ssh_password: Optional[str] = None
+    ssh_key: Optional[str] = None
+    install_docker: bool = True
 
 
 def _load_state():
@@ -237,6 +247,171 @@ def disable_node(ip: str):
         _save_state(st)
         return st["nodes"]
 
+
+# ===== Proxy Provisioning (SSH) =====
+@app.post("/v1/proxies/provision")
+def provision_proxy(req: ProvisionRequest, request: Request):
+    """Provision a remote host as Proxy node via SSH.
+    Does NOT store credentials; executes a bootstrap script remotely.
+    """
+    if not (req.ssh_password or req.ssh_key):
+        raise HTTPException(status_code=400, detail="Provide ssh_password or ssh_key")
+
+    base_url = str(request.base_url).rstrip('/')
+
+    with LOCK:
+        st = _load_state()
+        # Read code repo settings (used by remote to download initial code via controller archive)
+        code_repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
+        code_branch = st.get("code_branch") or "main"
+
+    log_lines = []
+
+    def _log(s: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {s}"
+        log_lines.append(line)
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = None
+    if req.ssh_key:
+        _log("loading SSH private key")
+        try:
+            pkey = paramiko.RSAKey.from_private_key(io.StringIO(req.ssh_key))
+        except Exception:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(req.ssh_key))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {e}")
+
+    try:
+        _log(f"connecting to {req.ip} as {req.ssh_user}")
+        client.connect(
+            hostname=req.ip,
+            username=req.ssh_user,
+            password=req.ssh_password,
+            pkey=pkey,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=15,
+        )
+        sftp = client.open_sftp()
+        try:
+            script = f"""#!/usr/bin/env bash
+set -euo pipefail
+CONTROLLER="{base_url}"
+CODE_REPO="{code_repo}"
+CODE_BRANCH="{code_branch}"
+ROLE="proxy"
+
+echo "[+] creating directories"
+sudo mkdir -p /opt/dns-proxy/agent /opt/dns-proxy/docker/proxy /opt/dns-proxy/domains
+
+echo "[+] installing prerequisites"
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -y
+  sudo apt-get install -y python3 python3-venv curl unzip ca-certificates
+  if {str(bool(True)).lower() if True else 'false'} && {str(bool(True)).lower()}; then
+    sudo apt-get install -y docker.io docker-compose-plugin || true
+  fi
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y python3 python3-venv curl unzip ca-certificates
+  sudo dnf install -y docker docker-compose || true
+  sudo systemctl enable --now docker || true
+else
+  echo "Unsupported package manager; install python3, venv, docker manually" >&2
+fi
+
+echo "[+] fetching initial code archive from controller"
+TMPDIR=$(mktemp -d)
+curl -L "$CONTROLLER/v1/code/archive" -o "$TMPDIR/src.zip"
+unzip -q -o "$TMPDIR/src.zip" -d "$TMPDIR/src"
+ROOT=$(dirname $(dirname $(find "$TMPDIR/src" -type f -name agent.py | head -n1)))
+if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then echo "could not locate source root" >&2; exit 1; fi
+
+echo "[+] staging agent files and proxy docker files"
+sudo cp -f "$ROOT/agent/agent.py" /opt/dns-proxy/agent/agent.py
+if [ -f "$ROOT/agent/requirements.txt" ]; then sudo cp -f "$ROOT/agent/requirements.txt" /opt/dns-proxy/agent/requirements.txt; fi
+if [ -f "$ROOT/docker/proxy/docker-compose.yml" ]; then sudo cp -f "$ROOT/docker/proxy/docker-compose.yml" /opt/dns-proxy/docker/proxy/docker-compose.yml; fi
+if [ -f "$ROOT/docker/proxy/sniproxy.conf.tmpl" ]; then sudo cp -f "$ROOT/docker/proxy/sniproxy.conf.tmpl" /opt/dns-proxy/docker/proxy/sniproxy.conf.tmpl; fi
+
+echo "[+] creating python venv and installing agent requirements"
+sudo python3 -m venv /opt/dns-proxy/agent/venv
+sudo /opt/dns-proxy/agent/venv/bin/pip install --upgrade pip
+if [ -f /opt/dns-proxy/agent/requirements.txt ]; then sudo /opt/dns-proxy/agent/venv/bin/pip install -r /opt/dns-proxy/agent/requirements.txt; fi
+
+echo "[+] writing agent config"
+cat <<EOF | sudo tee /opt/dns-proxy/agent/config.yml >/dev/null
+role: "$ROLE"
+controller_url: "$CONTROLLER"
+EOF
+
+echo "[+] installing systemd service"
+cat <<'EOF' | sudo tee /etc/systemd/system/dns-proxy-agent.service >/dev/null
+[Unit]
+Description=DNS Loki Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/config.yml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dns-proxy-agent.service
+
+echo "[+] done"
+"""
+            _log("uploading bootstrap script")
+            with sftp.file("/tmp/provision_proxy.sh", "w") as f:
+                f.write(script)
+            sftp.chmod("/tmp/provision_proxy.sh", 0o755)
+        finally:
+            sftp.close()
+
+        _log("executing bootstrap script")
+        stdin, stdout, stderr = client.exec_command("sudo /tmp/provision_proxy.sh")
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            for line in out.splitlines():
+                _log("REMOTE: " + line)
+        if err:
+            for line in err.splitlines():
+                _log("REMOTE-ERR: " + line)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"Remote provisioning failed with code {rc}")
+
+        # Upsert node record optimistically
+        with LOCK:
+            st = _load_state()
+            ip_str = req.ip
+            exists = False
+            for x in st["nodes"]:
+                if str(x.get("ip")) == ip_str:
+                    x["role"] = "proxy"
+                    x["enabled"] = True
+                    exists = True
+            if not exists:
+                st["nodes"].append({"ip": ip_str, "role": "proxy", "enabled": True, "agents_version_applied": 0, "diag": {}})
+            _save_state(st)
+
+        _log("provisioning completed")
+        return {"ok": True, "log": "\n".join(log_lines)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 @app.post("/v1/domains/sync")
 def bump_domains_version():
