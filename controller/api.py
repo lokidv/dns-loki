@@ -164,7 +164,14 @@ def upsert_node(n: Node):
         found = False
         for x in st["nodes"]:
             if str(x["ip"]) == str(n.ip):
+                # Preserve existing values when incoming fields are None (avoid erasing)
+                old_diag = x.get("diag")
+                old_ver = x.get("agents_version_applied")
                 x.update(n_payload)
+                if x.get("diag") is None and old_diag is not None:
+                    x["diag"] = old_diag
+                if x.get("agents_version_applied") is None and old_ver is not None:
+                    x["agents_version_applied"] = old_ver
                 found = True
         if not found:
             st["nodes"].append(n_payload)
