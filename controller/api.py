@@ -413,6 +413,26 @@ def set_agents_version(payload: AgentsVersionPayload):
         return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 
 
+@app.post("/v1/nodes/force-reset")
+def force_reset_agents():
+    """Force reset all agents by resetting their applied version to 0 and bumping target version.
+    This will trigger a fresh sync cycle for all agents.
+    """
+    with LOCK:
+        st = _load_state()
+        # Reset all agents' applied version to 0
+        for node in st["nodes"]:
+            node["agents_version_applied"] = 0
+        # Bump target version to force update
+        st["agents_version"] = int(st.get("agents_version", 1)) + 1
+        _save_state(st)
+        return {
+            "message": "All agents reset and target version bumped",
+            "agents_version": st["agents_version"],
+            "reset_nodes": len(st["nodes"])
+        }
+
+
 @app.post("/v1/code/self-update")
 def self_update_controller():
     """Download latest code and update controller files and UI, then restart service in background."""

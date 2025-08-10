@@ -98,6 +98,7 @@
           <input id="agentsTarget" placeholder="نسخه هدف" style="width:140px" />
           <button id="btnSetAgentsVersion">تنظیم نسخه هدف</button>
           <button id="btnAutoSync">همگام‌سازی خودکار</button>
+          <button id="btnForceReset" style="background-color:#e74c3c; color:white;">Force Reset</button>
         </div>
       </details>
       <details style="margin-top:10px;">
@@ -397,6 +398,33 @@ document.getElementById('btnSetAgentsVersion').onclick = async ()=>{
   await loadConfig();
   await loadNodes();
   alert('نسخه هدف تنظیم شد.');
+};
+
+// Force Reset all agents
+document.getElementById('btnForceReset').onclick = async ()=>{
+  if(!confirm('آیا مطمئن هستید که می‌خواهید همه Agent ها را reset کنید؟ این کار نسخه اعمال‌شده همه نودها را به 0 تغییر داده و نسخه هدف را افزایش می‌دهد.')){
+    return;
+  }
+  const btn = document.getElementById('btnForceReset');
+  btn.disabled = true;
+  btn.textContent = 'در حال Reset...';
+  try {
+    const r = await api('/v1/nodes/force-reset', { method:'POST' });
+    if(!r.ok){ 
+      const t = await r.text(); 
+      alert('خطا در Force Reset: ' + t); 
+      return; 
+    }
+    const result = await r.json();
+    await loadConfig();
+    await loadNodes();
+    alert(`Force Reset موفق: ${result.reset_nodes} نود reset شد. نسخه هدف جدید: ${result.agents_version}`);
+  } catch(e) {
+    alert('خطا در Force Reset: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Force Reset';
+  }
 };
 
 // auto sync: set target (if changed) and poll until all nodes applied
