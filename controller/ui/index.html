@@ -373,15 +373,16 @@ document.getElementById('btnSelfUpdate').onclick = async ()=>{
 // nodes update trigger
 document.getElementById('btnNodesUpdate').onclick = async ()=>{
   try {
-    const r = await api('/v1/nodes/update', { method:'POST' });
+    const r = await api('/v1/nodes/force-reset', { method:'POST' });
     if(!r.ok){
       const t = await r.text();
       alert('خطا در آپدیت نودها: ' + t);
       return;
     }
+    const result = await r.json();
     await loadConfig();
     await loadNodes();
-    alert('سیگنال آپدیت ایجنت‌ها ارسال شد.');
+    alert(`آپدیت نودها موفق: ${result.reset_nodes} نود reset شد. نسخه هدف جدید: ${result.agents_version}`);
   } catch (e) {
     alert('خطا در آپدیت نودها: ' + (e?.message || e));
   }
