@@ -41,10 +41,21 @@ def ensure_git_repo(repo_url: str, branch: str):
 
 
 def _github_zip_url(repo_url: str, branch: str):
-    m = re.search(r"github\\.com/([^/]+)/([^/.]+)", repo_url)
-    if not m:
+    # پشتیبانی از حالت‌های HTTPS/SSH و انتهای .git مشابه کنترلر
+    if not repo_url:
         return None
-    owner, repo = m.group(1), m.group(2)
+    s = repo_url.strip()
+    # حالت SSH مانند git@github.com:owner/repo(.git)
+    m_ssh = re.match(r"git@github\.com:([^/]+)/([^/]+)(?:\.git)?$", s)
+    if m_ssh:
+        owner, repo = m_ssh.group(1), m_ssh.group(2)
+        return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    # حالت‌های http/https با/بدون www و با/بدون .git
+    m_http = re.search(r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)", s)
+    if not m_http:
+        return None
+    owner, repo = m_http.group(1), m_http.group(2)
+    repo = repo[:-4] if repo.endswith('.git') else repo
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
@@ -60,11 +71,22 @@ def update_code_from_repo(repo_url: str, branch: str, role: str):
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmpdir)
         root = None
+        # اولویت: دایرکتوری که agent/agent.py دارد
         for name in os.listdir(tmpdir):
             p = os.path.join(tmpdir, name)
-            if os.path.isdir(p) and name.startswith("dns-loki-"):
-                root = p
-                break
+            if os.path.isdir(p):
+                if os.path.exists(os.path.join(p, "agent", "agent.py")):
+                    root = p
+                    break
+                if root is None and name.startswith("dns-loki-"):
+                    root = p
+        if not root:
+            # fallback: اولین دایرکتوری موجود
+            for name in os.listdir(tmpdir):
+                p = os.path.join(tmpdir, name)
+                if os.path.isdir(p):
+                    root = p
+                    break
         if not root:
             return False
         # Ensure destination directories exist

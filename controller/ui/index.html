@@ -379,6 +379,7 @@ document.getElementById('btnNodesUpdate').onclick = async ()=>{
       return;
     }
     await loadConfig();
+    await loadNodes();
     alert('سیگنال آپدیت ایجنت‌ها ارسال شد.');
   } catch (e) {
     alert('خطا در آپدیت نودها: ' + (e?.message || e));
