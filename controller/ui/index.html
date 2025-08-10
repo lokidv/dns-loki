@@ -277,6 +277,7 @@ async function loadNodes(){
     const total = (d.proxies_total!=null? d.proxies_total : 0);
     const coreRun = svc.coredns_running===true ? '<span class="status ok">روشن</span>' : (svc.coredns_running===false ? '<span class="status err">خاموش</span>' : '—');
     const sniRun = svc.sniproxy_running===true ? '<span class="status ok">روشن</span>' : (svc.sniproxy_running===false ? '<span class="status err">خاموش</span>' : '—');
+    const agentRun = (ts && (now - ts) <= 180) ? '<span class="status ok">روشن</span>' : '<span class="status err">خاموش</span>';
     const targ = files.targets_override || {};
     const snic = files.sniproxy_conf || {};
     const selLat = (d.selected_latency_ms!=null) ? (Math.round(d.selected_latency_ms) + ' ms') : null;
@@ -300,6 +301,7 @@ async function loadNodes(){
             <b>Latencyها</b><div>${latmap || '—'}</div>
             <b>DNS enforce</b><div>${d.enforce_dns===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
             <b>Proxy enforce</b><div>${d.enforce_proxy===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
+            <b>Agent</b><div>${agentRun}</div>
             <b>CoreDNS</b><div>${coreRun}</div>
             <b>SNI Proxy</b><div>${sniRun}</div>
             <b>targets.override</b><div>${targ.exists? 'بله' : 'خیر'} ${targ.size? `(${targ.size} B)` : ''}</div>
