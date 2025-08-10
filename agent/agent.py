@@ -248,11 +248,27 @@ def render_sniproxy_conf(domains):
 
 
 def restart_sniproxy():
-    # Prefer graceful reload to minimize downtime
-    res = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml kill --signal=HUP sniproxy", check=False)
-    if res.returncode != 0:
+    # If container exists, try graceful reload first; otherwise ensure it's up
+    log("sniproxy: restart requested")
+    ps = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml ps -q sniproxy", check=False)
+    has_container = bool(ps.stdout and ps.stdout.strip())
+    log(f"sniproxy: container present={has_container}")
+    if has_container:
+        log("sniproxy: attempting HUP reload")
+        res = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml kill --signal=HUP sniproxy", check=False)
+        log(f"sniproxy: HUP rc={res.returncode}")
+        if res.returncode == 0:
+            log("sniproxy: reloaded via HUP")
+            return
         # Fallback to restart if HUP unsupported or container not running
-        run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
+        log("sniproxy: HUP failed; attempting restart")
+        res2 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml restart sniproxy", check=False)
+        log(f"sniproxy: restart rc={res2.returncode}")
+        return
+    # No container yet -> bring it up
+    log("sniproxy: container not found; bringing up with compose up -d")
+    res3 = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml up -d sniproxy", check=False)
+    log(f"sniproxy: up -d rc={res3.returncode}")
 
 
 def _is_container_running(compose_file: str, service: str) -> bool:

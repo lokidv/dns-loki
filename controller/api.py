@@ -315,6 +315,8 @@ if command -v apt-get >/dev/null 2>&1; then
   if {str(bool(True)).lower() if True else 'false'} && {str(bool(True)).lower()}; then
     sudo apt-get install -y docker.io docker-compose-plugin || true
   fi
+  # Ensure docker service is running on apt-based systems
+  sudo systemctl enable --now docker || true
 elif command -v dnf >/dev/null 2>&1; then
   sudo dnf install -y python3 python3-venv curl unzip ca-certificates
   sudo dnf install -y docker docker-compose || true
