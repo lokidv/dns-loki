@@ -70,10 +70,15 @@
       </div>
       <div class="muted">افزودن دامنه روت کافی است؛ زیر‌دامنه‌ها خودکار پوشش داده می‌شوند.</div>
       <div class="divider"></div>
-      <table style="margin-top:10px">
-        <thead><tr><th>دامنه</th><th>عملیات</th></tr></thead>
-        <tbody id="domainsBody"></tbody>
-      </table>
+      <div class="input-inline" style="margin:8px 0;">
+        <input id="domainSearch" placeholder="جستجو در دامنه‌ها..." style="width:100%;" />
+      </div>
+      <div id="domainsList" style="max-height:260px; overflow:auto; border:1px solid var(--border); border-radius:10px;">
+        <table style="margin-top:0; width:100%; border-collapse:collapse;">
+          <thead><tr><th>دامنه</th><th>عملیات</th></tr></thead>
+          <tbody id="domainsBody"></tbody>
+        </table>
+      </div>
       <div class="count" id="domainsCount"></div>
     </div>
 
@@ -166,7 +171,7 @@
 
 <script>
 const api = (path, opts={}) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
-let APP = { cfg: null, refreshTimer: null };
+let APP = { cfg: null, refreshTimer: null, domainsAll: [] };
 
 async function loadConfig(){
   const r = await api('/v1/config');
@@ -195,12 +200,12 @@ async function loadConfig(){
   if(at) at.value = (j.agents_version!=null ? j.agents_version : '');
 }
 
-async function loadDomains(){
-  const r = await api('/v1/domains');
-  const arr = await r.json();
+function renderDomains(){
   const body = document.getElementById('domainsBody');
+  const q = (document.getElementById('domainSearch')?.value || '').trim().toLowerCase();
+  const list = q ? APP.domainsAll.filter(d => (d||'').toLowerCase().includes(q)) : APP.domainsAll.slice();
   body.innerHTML = '';
-  arr.forEach(d => {
+  list.forEach(d => {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><code>${d}</code></td><td class="row-actions"><button data-d="${d}">حذف</button></td>`;
     tr.querySelector('button').onclick = async (ev) => {
@@ -212,7 +217,14 @@ async function loadDomains(){
     };
     body.appendChild(tr);
   });
-  document.getElementById('domainsCount').textContent = `تعداد دامنه‌ها: ${arr.length}`;
+  const cnt = document.getElementById('domainsCount');
+  if(cnt){ cnt.textContent = `تعداد دامنه‌ها: ${list.length} از ${APP.domainsAll.length}`; }
+}
+
+async function loadDomains(){
+  const r = await api('/v1/domains');
+  APP.domainsAll = await r.json();
+  renderDomains();
 }
 
 async function loadClients(){
@@ -414,6 +426,10 @@ addForm.addEventListener('submit', async (e)=>{
   await loadDomains();
   await loadConfig();
 });
+
+// domain search handler
+const domSearch = document.getElementById('domainSearch');
+if(domSearch){ domSearch.addEventListener('input', renderDomains); }
 
 // sync button
 const syncBtn = document.getElementById('syncBtn');
