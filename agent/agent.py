@@ -472,8 +472,17 @@ def main():
                 my_ip = None
 
         # Build client allowlists per scope
-        dns_clients = [str(c["ip"]) for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns", "proxy"]) ]
-        proxy_clients = [str(c["ip"]) for c in conf.get("clients", []) if "proxy" in c.get("scope", ["dns", "proxy"]) ]
+        def _has_scope(client, target_scope):
+            scope = client.get("scope", ["dns", "proxy"])
+            # Handle both string and array formats from UI
+            if isinstance(scope, str):
+                scope = [scope]
+            elif not isinstance(scope, list):
+                scope = ["dns", "proxy"]  # default fallback
+            return target_scope in scope
+        
+        dns_clients = [str(c["ip"]) for c in conf.get("clients", []) if _has_scope(c, "dns")]
+        proxy_clients = [str(c["ip"]) for c in conf.get("clients", []) if _has_scope(c, "proxy")]
         proxies = [n for n in conf.get("nodes", []) if n.get("role") == "proxy" and n.get("enabled", True)]
         proxy_ips = [str(n["ip"]) for n in proxies]
         # DNS nodes (Iran) are the only legitimate callers of proxy servers

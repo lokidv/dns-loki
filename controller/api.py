@@ -111,7 +111,7 @@ def _load_state():
             "domains_version": 1,
             "git_repo": DEFAULT_GIT_REPO,
             "git_branch": DEFAULT_GIT_BRANCH,
-            "agents_version": 1,
+            "agents_version": 34,
             "code_repo": os.environ.get("CODE_REPO", "https://github.com/lokidv/dns-loki.git"),
             "code_branch": os.environ.get("CODE_BRANCH", "main"),
             "enforce_dns_clients": False,
