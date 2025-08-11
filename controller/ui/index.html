@@ -26,8 +26,8 @@
     button:hover{ border-color: var(--brand); box-shadow: 0 0 0 2px rgba(92,124,255,.15) inset; }
     .btn-primary{ background: linear-gradient(180deg, #6d86ff, #4864ff); border-color: #4864ff; color:#fff; }
     .toolbar{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    table { width:100%; border-collapse: collapse; table-layout: fixed; }
-    th, td { border-bottom:1px solid var(--border); padding:8px 10px; font-size: 14px; word-break: break-word; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; font-size: 14px; word-break: normal; }
     th{ color:var(--muted); font-weight:600; text-align:right; background: rgba(255,255,255,0.02); }
     code { background:var(--surface-2); padding:2px 6px; border-radius:6px; }
     .muted { color:var(--muted); font-size:13px; }
@@ -50,6 +50,16 @@
     .kv b{ color:var(--muted); font-weight:600; }
     /* Prevent horizontal overflow and improve tables */
     code{ overflow-wrap:anywhere; word-break:break-word; direction:ltr; }
+    /* avoid awkward wraps on chips/buttons/status */
+    .pill, .status, button { white-space: nowrap; }
+    .pill, .status{ display:inline-flex; align-items:center; }
+    .cell-actions .input-inline{ flex-wrap: nowrap; }
+    /* nodes table tuning */
+    .nodes-table th, .nodes-table td { vertical-align: middle; font-size:13px; }
+    .nodes-table .cell-actions{ min-width: 190px; }
+    .cell-ip{ direction:ltr; white-space: nowrap; min-width:120px; }
+    .cell-ip code{ overflow-wrap: normal; word-break: normal; }
+    .btn-details, .btn-toggle{ min-width:84px; text-align:center; }
     td .input-inline{ flex-wrap:wrap; }
     #domainsList{ overflow-y:auto; overflow-x:hidden; }
     #domainsList table{ table-layout: fixed; }
@@ -136,7 +146,7 @@
     </div>
     <div class="card col-6">
       <h2>نودها</h2>
-      <table class="table-sticky">
+      <table class="table-sticky nodes-table">
         <thead>
           <tr>
             <th>IP</th>
@@ -275,15 +285,15 @@ async function loadNodes(){
     } else { cls='warn'; status='نامشخص'; }
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><code>${n.ip}</code></td>
+      <td class="cell-ip"><code>${n.ip}</code></td>
       <td><span class="pill">${n.role||'—'}</span></td>
       <td class="right">${applied}</td>
       <td class="right">${target??'—'}</td>
       <td><span class="status ${cls}">${status}</span></td>
       <td>${ts? fmtAgo(ts): '—'}</td>
       <td>${n.enabled ? '<span class="status ok">فعال</span>' : '<span class="status err">غیرفعال</span>'}</td>
-      <td>
-        <div class="input-inline" style="gap:6px; flex-wrap:wrap;">
+      <td class="cell-actions">
+        <div class="input-inline" style="gap:6px;">
           <button class="btn-details">جزئیات</button>
           <button class="btn-toggle">${n.enabled ? 'غیرفعال' : 'فعال'}</button>
         </div>
