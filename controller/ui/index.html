@@ -436,7 +436,6 @@ async function loadNodes(){
               </div>
               <div class="input-inline">
                 <button class="btn-restart">ری‌استارت</button>
-                <button class="btn-debug">دیباگ nftables</button>
               </div>
               <pre class="rsLog" style="white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--border); padding:10px; border-radius:10px; max-height:200px; overflow:auto;"></pre>
             </div>
@@ -496,39 +495,6 @@ async function loadNodes(){
         logEl.textContent = (e?.message || e);
       }finally{
         btnR.disabled = false; btnR.textContent = oldTxt;
-      }
-    };
-    // debug nftables handler
-    const btnD = trd.querySelector('.btn-debug');
-    btnD.onclick = async () => {
-      const ip2 = encodeURIComponent(n.ip);
-      const user = (trd.querySelector('.rsUser').value || '').trim();
-      const pass = trd.querySelector('.rsPass').value;
-      const key = trd.querySelector('.rsKey').value;
-      const logEl = trd.querySelector('.rsLog');
-      logEl.textContent = '';
-      if(!user){ alert('Username الزامی است'); return; }
-      if(!pass && !key){ alert('لطفاً یکی از password یا key را وارد کنید'); return; }
-      const body = { ssh_user: user };
-      if(pass) body.ssh_password = pass;
-      if(key) body.ssh_key = key;
-      btnD.disabled = true; const oldTxt = btnD.textContent; btnD.textContent = 'در حال دیباگ...';
-      try{
-        const r = await api(`/v1/nodes/${ip2}/debug`, { method:'POST', body: JSON.stringify(body) });
-        const txt = await r.text();
-        if(!r.ok){
-          logEl.textContent = txt || 'خطای نامشخص';
-          alert('دیباگ ناموفق بود');
-          return;
-        }
-        let j = {};
-        try{ j = JSON.parse(txt); }catch(e){}
-        logEl.textContent = j.output || txt || 'بدون خروجی';
-        if(j.error) logEl.textContent += '\n\nERROR:\n' + j.error;
-      }catch(e){
-        logEl.textContent = (e?.message || e);
-      }finally{
-        btnD.disabled = false; btnD.textContent = oldTxt;
       }
     };
   });
