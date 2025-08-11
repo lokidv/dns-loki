@@ -472,7 +472,7 @@ echo "[+] done"
             pass
 
 @app.post("/v1/nodes/{ip}/debug")
-def debug_node_nftables(ip: str, payload: RestartPayload):
+def debug_node_nftables(ip: str, payload: RestartRequest):
     """Debug nftables status on a node via SSH"""
     try:
         ssh = paramiko.SSHClient()
