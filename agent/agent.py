@@ -232,6 +232,25 @@ def render_coredns_targets(domains, healthy_ips):
     lines.append("}")
     return "\n".join(lines) + "\n"
 
+def _ensure_acl_symlink():
+    """برای CoreDNS native مسیر import را تضمین می‌کند.
+    اگر /etc/coredns/acl.override وجود ندارد، به فایل داخل دایرکتوری docker لینک می‌سازد.
+    بی‌خطر و idempotent است.
+    """
+    try:
+        Path("/etc/coredns").mkdir(parents=True, exist_ok=True)
+        src = Path(f"{DEF_CORE_DNS_DIR}/acl.override")
+        dst = Path("/etc/coredns/acl.override")
+        # Always replace destination with a symlink to src (ln -sf semantics)
+        try:
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+        except Exception:
+            pass
+        os.symlink(src, dst)
+    except Exception as e:
+        log(f"acl: ensure symlink failed -> {e}")
+
 
 def render_v6block(domains):
     regex = build_regex_from_domains(domains)
@@ -590,6 +609,8 @@ def main():
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
             Path(f"{DEF_CORE_DNS_DIR}/acl.override").write_text(acltxt)
+            # Ensure native CoreDNS can import ACL file (no-op for container)
+            _ensure_acl_symlink()
             # Reload CoreDNS
             reload_coredns()
 
