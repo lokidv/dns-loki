@@ -11,23 +11,23 @@
     }
     *{ box-sizing: border-box; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background:var(--bg); color:var(--text); }
-    .container{ max-width:1200px; margin: 24px auto; padding: 0 16px; }
+    .container{ max-width:1200px; margin: 24px auto; padding: 0 16px; overflow-x:hidden; }
     h1{ margin: 0 0 16px 0; font-size: 22px; display:flex; align-items:center; gap:10px; }
     h2{ margin: 0 0 12px 0; font-size: 18px; }
-    .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; }
+    .row { display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap:16px; }
     .col-6{ grid-column: span 6; }
     .col-4{ grid-column: span 4; }
     .col-8{ grid-column: span 8; }
     .col-12{ grid-column: span 12; }
     @media (max-width: 900px){ .col-6, .col-4, .col-8 { grid-column: span 12; } }
-    .card { background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid var(--border); border-radius:12px; padding:16px; backdrop-filter: blur(6px); }
+    .card { background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid var(--border); border-radius:12px; padding:16px; backdrop-filter: blur(6px); overflow:hidden; }
     input, button, select, textarea { background:var(--surface-2); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
     button { cursor:pointer; transition:.2s; }
     button:hover{ border-color: var(--brand); box-shadow: 0 0 0 2px rgba(92,124,255,.15) inset; }
     .btn-primary{ background: linear-gradient(180deg, #6d86ff, #4864ff); border-color: #4864ff; color:#fff; }
     .toolbar{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { border-bottom:1px solid var(--border); padding:8px 10px; font-size: 14px; }
+    table { width:100%; border-collapse: collapse; table-layout: fixed; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; font-size: 14px; word-break: break-word; }
     th{ color:var(--muted); font-weight:600; text-align:right; background: rgba(255,255,255,0.02); }
     code { background:var(--surface-2); padding:2px 6px; border-radius:6px; }
     .muted { color:var(--muted); font-size:13px; }
@@ -45,9 +45,17 @@
     .input-inline{ display:flex; gap:8px; }
     .divider{ height:1px; background: var(--border); margin: 10px 0; }
     .count{ font-size:12px; color:var(--muted); }
-    .details{ background: var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:10px; }
+    .details{ background: var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:10px; max-width:100%; overflow:hidden; }
     .kv{ display:grid; grid-template-columns: 160px 1fr; gap:6px 10px; font-size:13px; }
     .kv b{ color:var(--muted); font-weight:600; }
+    /* Prevent horizontal overflow and improve tables */
+    code{ overflow-wrap:anywhere; word-break:break-word; direction:ltr; }
+    td .input-inline{ flex-wrap:wrap; }
+    #domainsList{ overflow-y:auto; overflow-x:hidden; }
+    #domainsList table{ table-layout: fixed; }
+    #domainsList th:first-child, #domainsList td:first-child{ width:70%; }
+    #domainsList th:last-child, #domainsList td:last-child{ width:30%; }
+    .table-sticky thead th{ position: sticky; top: 0; z-index: 2; }
   </style>
 </head>
 <body>
@@ -74,7 +82,7 @@
         <input id="domainSearch" placeholder="جستجو در دامنه‌ها..." style="width:100%;" />
       </div>
       <div id="domainsList" style="max-height:260px; overflow:auto; border:1px solid var(--border); border-radius:10px;">
-        <table style="margin-top:0; width:100%; border-collapse:collapse;">
+        <table class="table-sticky" style="margin-top:0; width:100%; border-collapse:collapse;">
           <thead><tr><th>دامنه</th><th>عملیات</th></tr></thead>
           <tbody id="domainsBody"></tbody>
         </table>
@@ -121,14 +129,14 @@
     <div class="card col-6">
       <h2>کلاینت‌ها</h2>
       <div class="muted">لیست کلاینت‌های مجاز و محدوده‌ها</div>
-      <table>
+      <table class="table-sticky">
         <thead><tr><th>IP</th><th>Scope</th></tr></thead>
         <tbody id="clients"></tbody>
       </table>
     </div>
     <div class="card col-6">
       <h2>نودها</h2>
-      <table>
+      <table class="table-sticky">
         <thead>
           <tr>
             <th>IP</th>
@@ -275,7 +283,7 @@ async function loadNodes(){
       <td>${ts? fmtAgo(ts): '—'}</td>
       <td>${n.enabled ? '<span class="status ok">فعال</span>' : '<span class="status err">غیرفعال</span>'}</td>
       <td>
-        <div class="input-inline" style="gap:6px;">
+        <div class="input-inline" style="gap:6px; flex-wrap:wrap;">
           <button class="btn-details">جزئیات</button>
           <button class="btn-toggle">${n.enabled ? 'غیرفعال' : 'فعال'}</button>
         </div>
