@@ -471,6 +471,57 @@ echo "[+] done"
         except Exception:
             pass
 
+@app.post("/v1/nodes/{ip}/debug")
+def debug_node_nftables(ip: str, payload: RestartPayload):
+    """Debug nftables status on a node via SSH"""
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Connect using provided credentials
+        if payload.ssh_key:
+            key = paramiko.RSAKey.from_private_key(io.StringIO(payload.ssh_key))
+            ssh.connect(ip, username=payload.ssh_user, pkey=key, timeout=10)
+        else:
+            ssh.connect(ip, username=payload.ssh_user, password=payload.ssh_password, timeout=10)
+        
+        # Debug commands to check nftables status
+        debug_script = """#!/bin/bash
+echo "=== Current nftables ruleset ==="
+nft list ruleset
+echo ""
+echo "=== DNS clients set contents ==="
+nft list set inet filter allow_dns_clients 2>/dev/null || echo "Set not found"
+echo ""
+echo "=== Proxy clients set contents ==="
+nft list set inet filter allow_proxy_clients 2>/dev/null || echo "Set not found"
+echo ""
+echo "=== DNS service status ==="
+ss -ulpn | grep :53 || echo "No DNS service on port 53"
+echo ""
+echo "=== Agent log tail ==="
+tail -20 /opt/dns-proxy/agent/agent.log 2>/dev/null || echo "No agent log"
+"""
+        
+        stdin, stdout, stderr = ssh.exec_command(debug_script)
+        output = stdout.read().decode('utf-8', errors='ignore')
+        error = stderr.read().decode('utf-8', errors='ignore')
+        
+        ssh.close()
+        
+        return {
+            "success": True,
+            "output": output,
+            "error": error if error else None
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "output": ""
+        }
+
 @app.post("/v1/nodes/{ip}/restart")
 def restart_node_services(ip: str, req: RestartRequest):
     """Restart one or more services on a remote node via SSH (agent, coredns, sniproxy).
