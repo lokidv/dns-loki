@@ -4,17 +4,20 @@ table inet filter {
   }
   chains {
     input {
-      type filter hook input priority 0;
+      type filter hook input priority -100;
       ct state established,related accept
       iif lo accept
       # SSH
       tcp dport 22 accept
       # DNS restricted to allowlist
-      udp dport 53 ip saddr @allow_dns_clients accept
-      tcp dport 53 ip saddr @allow_dns_clients accept
+      udp dport 53 ip saddr @allow_dns_clients counter accept
+      tcp dport 53 ip saddr @allow_dns_clients counter accept
       # drop other DNS
-      udp dport 53 drop
-      tcp dport 53 drop
+      udp dport 53 counter drop
+      tcp dport 53 counter drop
+      # prevent IPv6 DNS bypass entirely (unless IPv6 allowlisting is implemented)
+      udp dport 53 ip6 saddr ::/0 counter drop
+      tcp dport 53 ip6 saddr ::/0 counter drop
       # default accept other traffic (adjust to your policy)
       accept
     }
