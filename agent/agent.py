@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import os
 import re
 import shutil
@@ -340,6 +341,17 @@ def nft_ensure_set(set_name: str):
     if res.returncode != 0:
         run(f"nft add set inet filter {set_name} {{ type ipv4_addr; flags interval; }}", check=False)
 
+def only_ipv4(ips):
+    out = []
+    for s in (ips or []):
+        try:
+            ip = ipaddress.ip_address(str(s))
+            if ip.version == 4:
+                out.append(str(ip))
+        except Exception:
+            continue
+    return out
+
 
 def nft_replace_set(set_name: str, ips):
     if not ips:
@@ -349,6 +361,23 @@ def nft_replace_set(set_name: str, ips):
     elements = ", ".join(ips)
     run(f"nft flush set inet filter {set_name}", check=False)
     run(f"nft add element inet filter {set_name} {{ {elements} }}", check=False)
+
+
+def nft_list_set(set_name: str):
+    try:
+        res = run(f"nft list set inet filter {set_name}", check=False)
+        if res.returncode != 0 or not getattr(res, "stdout", b""):
+            return []
+        # stdout is bytes due to PIPE; decode safely
+        txt = res.stdout.decode(errors="ignore") if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+        m = re.search(r"elements\s*=\s*\{([^}]*)\}", txt, re.S)
+        if not m:
+            return []
+        raw = m.group(1)
+        elems = [e.strip() for e in raw.split(",") if e.strip()]
+        return only_ipv4(elems)
+    except Exception:
+        return []
 
 
 def apply_dns_policy(enforce: bool):
@@ -442,9 +471,13 @@ def main():
             except Exception:
                 my_ip = None
 
-        clients = [c["ip"] for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns","proxy"]) ]
+        # Build client allowlists per scope
+        dns_clients = [str(c["ip"]) for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns", "proxy"]) ]
+        proxy_clients = [str(c["ip"]) for c in conf.get("clients", []) if "proxy" in c.get("scope", ["dns", "proxy"]) ]
         proxies = [n for n in conf.get("nodes", []) if n.get("role") == "proxy" and n.get("enabled", True)]
         proxy_ips = [str(n["ip"]) for n in proxies]
+        # DNS nodes (Iran) are the only legitimate callers of proxy servers
+        dns_node_ips = [str(n["ip"]) for n in conf.get("nodes", []) if n.get("role") == "dns" and n.get("enabled", True)]
         enforce_dns = conf.get("enforce_dns_clients", False)
         enforce_proxy = conf.get("enforce_proxy_clients", False)
 
@@ -518,7 +551,10 @@ def main():
             apply_dns_policy(enforce_dns)
             # Update nft set of allowed dns clients
             if enforce_dns:
-                nft_replace_set("allow_dns_clients", clients)
+                nft_replace_set("allow_dns_clients", only_ipv4(dns_clients))
+            else:
+                # When enforcement is disabled, clear the set to reflect runtime state
+                nft_replace_set("allow_dns_clients", [])
             # Health check proxies
             sni_host = domains[0].lstrip("*.")
             lat_map = {}
@@ -544,7 +580,12 @@ def main():
             apply_proxy_policy(enforce_proxy)
             # Update nft set of allowed proxy clients
             if enforce_proxy:
-                nft_replace_set("allow_proxy_clients", clients)
+                # Only allow Iran DNS nodes (required), plus any explicit proxy-scope clients (if defined)
+                allowed_proxy_clients = sorted(set(proxy_clients + dns_node_ips))
+                nft_replace_set("allow_proxy_clients", only_ipv4(allowed_proxy_clients))
+            else:
+                # When enforcement is disabled, clear the set to reflect runtime state
+                nft_replace_set("allow_proxy_clients", [])
             # Render sniproxy.conf from template
             conf_txt = render_sniproxy_conf(domains)
             out_path = Path(DEF_PROXY_DIR) / "sniproxy.conf"
@@ -566,6 +607,11 @@ def main():
                         log("sniproxy: start skipped; docker not ready")
 
         # Build diagnostics after applying configs
+        # Gather runtime nft set elements (best-effort)
+        nft_dns_elems = nft_list_set("allow_dns_clients") if role == "dns" else None
+        nft_proxy_elems = nft_list_set("allow_proxy_clients") if role == "proxy" else None
+        # Compute effective allowlists from config perspective
+        proxy_effective_allow = sorted(set(proxy_clients + dns_node_ips)) if proxy_clients or dns_node_ips else []
         diag = {
             "role": role,
             "domains_count": len(domains),
@@ -576,6 +622,15 @@ def main():
             "proxies_latency_ms": (lat_map if role == "dns" else None),
             "enforce_dns": bool(enforce_dns),
             "enforce_proxy": bool(enforce_proxy),
+            "client_allowlists": {
+                "dns_clients_configured": only_ipv4(dns_clients),
+                "proxy_clients_configured": only_ipv4(proxy_clients),
+                "proxy_effective_allowlist": only_ipv4(proxy_effective_allow),
+            },
+            "nft_sets": {
+                "allow_dns_clients": (nft_dns_elems or []),
+                "allow_proxy_clients": (nft_proxy_elems or []),
+            },
             "svc": {
                 "coredns_running": _is_container_running(f"{DEF_CORE_DNS_DIR}/docker-compose.yml", "coredns") if role == "dns" else None,
                 "sniproxy_running": _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy") if role == "proxy" else None,

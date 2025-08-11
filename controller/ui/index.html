@@ -126,6 +126,14 @@
         </div>
       </details>
       <details style="margin-top:10px;">
+        <summary>اعمال محدودیت دسترسی (enforce)</summary>
+        <div style="margin-top:8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+          <label><input type="checkbox" id="flagDns" /> Enforce DNS</label>
+          <label><input type="checkbox" id="flagProxy" /> Enforce Proxy</label>
+          <button id="btnSaveFlags">ذخیره</button>
+        </div>
+      </details>
+      <details style="margin-top:10px;">
         <summary>تنظیم ریپو و برنچ کد</summary>
         <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input id="codeRepo" placeholder="https://github.com/lokidv/dns-loki.git" style="min-width:360px" />
@@ -139,9 +147,16 @@
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
       <h2>کلاینت‌ها</h2>
-      <div class="muted">لیست کلاینت‌های مجاز و محدوده‌ها</div>
+      <div class="muted">افزودن/ویرایش کلاینت‌های مجاز و محدوده‌ها</div>
+      <div class="input-inline" style="margin:8px 0; gap:10px; flex-wrap:wrap;">
+        <input id="clIp" placeholder="IP (IPv4/IPv6)" style="min-width:160px;" />
+        <input id="clNote" placeholder="یادداشت (اختیاری)" style="min-width:200px;" />
+        <label><input type="checkbox" id="clDns" checked /> DNS</label>
+        <label><input type="checkbox" id="clProxy" checked /> Proxy</label>
+        <button id="btnAddClient" class="btn-primary">افزودن</button>
+      </div>
       <table class="table-sticky">
-        <thead><tr><th>IP</th><th>Scope</th></tr></thead>
+        <thead><tr><th>IP</th><th>Scope</th><th>یادداشت</th><th>عملیات</th></tr></thead>
         <tbody id="clients"></tbody>
       </table>
     </div>
@@ -221,6 +236,11 @@ async function loadConfig(){
   document.getElementById('codeBranch').value = j.code_branch || 'main';
   const at = document.getElementById('agentsTarget');
   if(at) at.value = (j.agents_version!=null ? j.agents_version : '');
+  // sync enforce toggles if present
+  const fd = document.getElementById('flagDns');
+  const fp = document.getElementById('flagProxy');
+  if(fd) fd.checked = !!j.enforce_dns_clients;
+  if(fp) fp.checked = !!j.enforce_proxy_clients;
 }
 
 function renderDomains(){
@@ -257,7 +277,47 @@ async function loadClients(){
   el.innerHTML = '';
   arr.forEach(c => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td><code>${c.ip}</code></td><td><span class="muted">${(c.scope||[]).join(', ')}</span></td>`;
+    const hasDns = Array.isArray(c.scope) && c.scope.includes('dns');
+    const hasProxy = Array.isArray(c.scope) && c.scope.includes('proxy');
+    const note = c.note || '';
+    tr.innerHTML = `
+      <td><code>${c.ip}</code></td>
+      <td>
+        <div class="chips" style="gap:12px;">
+          <label><input type="checkbox" class="scDns" ${hasDns?'checked':''} /> DNS</label>
+          <label><input type="checkbox" class="scProxy" ${hasProxy?'checked':''} /> Proxy</label>
+        </div>
+      </td>
+      <td><input class="clRowNote" placeholder="یادداشت" value="${note.replace(/"/g, '&quot;')}" style="min-width:200px;" /></td>
+      <td class="row-actions">
+        <div class="input-inline" style="gap:6px;">
+          <button class="btnSave">ذخیره</button>
+          <button class="btnDel" style="background-color:#e74c3c; color:white;">حذف</button>
+        </div>
+      </td>`;
+    // delete
+    tr.querySelector('.btnDel').onclick = async () => {
+      const r = await api(`/v1/clients/${encodeURIComponent(c.ip)}`, { method:'DELETE' });
+      if(!r.ok){ const t = await r.text(); alert('خطا در حذف کلاینت: ' + t); return; }
+      await Promise.all([loadClients(), loadConfig()]);
+    };
+    // save (delete + add)
+    tr.querySelector('.btnSave').onclick = async () => {
+      const scDns = !!tr.querySelector('.scDns')?.checked;
+      const scProxy = !!tr.querySelector('.scProxy')?.checked;
+      const noteVal = tr.querySelector('.clRowNote')?.value || '';
+      const scope = [];
+      if(scDns) scope.push('dns');
+      if(scProxy) scope.push('proxy');
+      if(scope.length === 0){ alert('حداقل یکی از DNS یا Proxy را انتخاب کنید.'); return; }
+      // delete old
+      await api(`/v1/clients/${encodeURIComponent(c.ip)}`, { method:'DELETE' });
+      // add new
+      const body = { ip: c.ip, note: noteVal, scope };
+      const r = await api('/v1/clients', { method:'POST', body: JSON.stringify(body) });
+      if(!r.ok){ const t = await r.text(); alert('خطا در ذخیره کلاینت: ' + t); return; }
+      await Promise.all([loadClients(), loadConfig()]);
+    };
     el.appendChild(tr);
   });
 }
@@ -325,6 +385,19 @@ async function loadNodes(){
 
     const trd = document.createElement('tr');
     trd.style.display = 'none';
+    // Build allowlists/nft sets diagnostics
+    const ca = d.client_allowlists || {};
+    const nft = d.nft_sets || {};
+    const dnsCfgArr = Array.isArray(ca.dns_clients_configured) ? ca.dns_clients_configured : [];
+    const proxyCfgArr = Array.isArray(ca.proxy_clients_configured) ? ca.proxy_clients_configured : [];
+    const proxyEffArr = Array.isArray(ca.proxy_effective_allowlist) ? ca.proxy_effective_allowlist : [];
+    const dnsNftArr = Array.isArray(nft.allow_dns_clients) ? nft.allow_dns_clients : [];
+    const proxyNftArr = Array.isArray(nft.allow_proxy_clients) ? nft.allow_proxy_clients : [];
+    const dnsCfg = dnsCfgArr.join(', ');
+    const proxyCfg = proxyCfgArr.join(', ');
+    const proxyEff = proxyEffArr.join(', ');
+    const dnsNft = dnsNftArr.join(', ');
+    const proxyNft = proxyNftArr.join(', ');
     trd.innerHTML = `
       <td colspan="8">
         <div class="details">
@@ -336,6 +409,11 @@ async function loadNodes(){
             <b>Latencyها</b><div>${latmap || '—'}</div>
             <b>DNS enforce</b><div>${d.enforce_dns===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
             <b>Proxy enforce</b><div>${d.enforce_proxy===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
+            <b>DNS allowlist (config)</b><div>${dnsCfg || '—'} ${dnsCfgArr.length? `<span class='pill'>${dnsCfgArr.length}</span>`:''}</div>
+            <b>DNS allowlist (nft)</b><div>${dnsNft || '—'} ${dnsNftArr.length? `<span class='pill'>${dnsNftArr.length}</span>`:''}</div>
+            <b>Proxy allowlist (config)</b><div>${proxyCfg || '—'} ${proxyCfgArr.length? `<span class='pill'>${proxyCfgArr.length}</span>`:''}</div>
+            <b>Proxy allowlist (effective)</b><div>${proxyEff || '—'} ${proxyEffArr.length? `<span class='pill'>${proxyEffArr.length}</span>`:''}</div>
+            <b>Proxy allowlist (nft)</b><div>${proxyNft || '—'} ${proxyNftArr.length? `<span class='pill'>${proxyNftArr.length}</span>`:''}</div>
             <b>Agent</b><div>${agentRun}</div>
             <b>CoreDNS</b><div>${coreRun}</div>
             <b>SNI Proxy</b><div>${sniRun}</div>
@@ -427,6 +505,38 @@ async function init(){
 }
 
 init();
+
+// add client handler
+document.getElementById('btnAddClient')?.addEventListener('click', async () => {
+  const ip = (document.getElementById('clIp')?.value || '').trim();
+  const note = (document.getElementById('clNote')?.value || '').trim();
+  const scDns = !!document.getElementById('clDns')?.checked;
+  const scProxy = !!document.getElementById('clProxy')?.checked;
+  if(!ip){ alert('IP الزامی است'); return; }
+  const scope = [];
+  if(scDns) scope.push('dns');
+  if(scProxy) scope.push('proxy');
+  if(scope.length === 0){ alert('حداقل یکی از DNS یا Proxy را انتخاب کنید.'); return; }
+  const body = { ip, note, scope };
+  const r = await api('/v1/clients', { method:'POST', body: JSON.stringify(body) });
+  if(!r.ok){ const t = await r.text(); alert('خطا در افزودن کلاینت: ' + t); return; }
+  // reset inputs
+  document.getElementById('clIp').value = '';
+  document.getElementById('clNote').value = '';
+  document.getElementById('clDns').checked = true;
+  document.getElementById('clProxy').checked = true;
+  await Promise.all([loadClients(), loadConfig()]);
+});
+
+// save flags handler
+document.getElementById('btnSaveFlags')?.addEventListener('click', async () => {
+  const enforce_dns_clients = !!document.getElementById('flagDns')?.checked;
+  const enforce_proxy_clients = !!document.getElementById('flagProxy')?.checked;
+  const r = await api('/v1/flags', { method:'POST', body: JSON.stringify({ enforce_dns_clients, enforce_proxy_clients }) });
+  if(!r.ok){ const t = await r.text(); alert('خطا در ذخیره enforce: ' + t); return; }
+  await loadConfig();
+  alert('ذخیره شد.');
+});
 
 // helpers
 function fmtAgo(ts){

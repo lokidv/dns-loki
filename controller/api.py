@@ -75,6 +75,11 @@ class DomainItem(BaseModel):
     domain: str
 
 
+class FlagsPayload(BaseModel):
+    enforce_dns_clients: Optional[bool] = None
+    enforce_proxy_clients: Optional[bool] = None
+
+
 class ProvisionRequest(BaseModel):
     ip: str
     ssh_user: str
@@ -171,6 +176,31 @@ def del_client(ip: str):
         st["clients"] = [x for x in st["clients"] if str(x["ip"]) != ip]
         _save_state(st)
         return st["clients"]
+
+
+@app.get("/v1/flags")
+def get_flags():
+    with LOCK:
+        st = _load_state()
+        return {
+            "enforce_dns_clients": bool(st.get("enforce_dns_clients", False)),
+            "enforce_proxy_clients": bool(st.get("enforce_proxy_clients", False)),
+        }
+
+
+@app.post("/v1/flags")
+def set_flags(f: FlagsPayload):
+    with LOCK:
+        st = _load_state()
+        if f.enforce_dns_clients is not None:
+            st["enforce_dns_clients"] = bool(f.enforce_dns_clients)
+        if f.enforce_proxy_clients is not None:
+            st["enforce_proxy_clients"] = bool(f.enforce_proxy_clients)
+        _save_state(st)
+        return {
+            "enforce_dns_clients": st.get("enforce_dns_clients", False),
+            "enforce_proxy_clients": st.get("enforce_proxy_clients", False),
+        }
 
 
 @app.get("/v1/nodes", response_model=List[Node])
