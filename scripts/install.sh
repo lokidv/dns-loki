@@ -134,8 +134,11 @@ install_coredns_native() {
 
   # Ensure override files are resolvable at /etc/coredns/ for Corefile imports
   mkdir -p /etc/coredns
+  # Ensure placeholder override files exist to avoid CoreDNS import errors on first start
+  touch /opt/dns-proxy/docker/dns/targets.override /opt/dns-proxy/docker/dns/v6block.override /opt/dns-proxy/docker/dns/acl.override
   ln -sf /opt/dns-proxy/docker/dns/targets.override /etc/coredns/targets.override
   ln -sf /opt/dns-proxy/docker/dns/v6block.override /etc/coredns/v6block.override
+  ln -sf /opt/dns-proxy/docker/dns/acl.override /etc/coredns/acl.override
 
   # Create systemd unit for native CoreDNS
   cat >/etc/systemd/system/coredns-native.service <<'SVC'

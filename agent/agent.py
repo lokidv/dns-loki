@@ -241,6 +241,21 @@ def render_v6block(domains):
 }}
 """
 
+def render_coredns_acl(dns_clients, enforce: bool):
+    """تولید فایل acl.override برای CoreDNS.
+    اگر enforce=False باشد، فایل خالی/آزاد تولید می‌کنیم تا محدودیتی اعمال نشود.
+    اگر enforce=True و لیست خالی باشد، همه مسدود می‌شوند.
+    """
+    if not enforce:
+        return "# acl disabled\n"
+    ipv4s = only_ipv4(dns_clients)
+    lines = ["acl {"]
+    for ip in ipv4s:
+        lines.append(f"  allow net {ip}/32")
+    lines.append("  block")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
 
 def reload_coredns():
     # If running via Docker, send HUP to PID 1 in the container
@@ -571,8 +586,10 @@ def main():
             # Render CoreDNS override files
             targets = render_coredns_targets(domains, selected)
             v6blk = render_v6block(domains)
+            acltxt = render_coredns_acl(dns_clients, enforce_dns)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
+            Path(f"{DEF_CORE_DNS_DIR}/acl.override").write_text(acltxt)
             # Reload CoreDNS
             reload_coredns()
 
@@ -639,6 +656,10 @@ def main():
                 "targets_override": {
                     "exists": Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists(),
                     "size": (Path(f"{DEF_CORE_DNS_DIR}/targets.override").stat().st_size if Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists() else 0),
+                },
+                "acl_override": {
+                    "exists": Path(f"{DEF_CORE_DNS_DIR}/acl.override").exists(),
+                    "size": (Path(f"{DEF_CORE_DNS_DIR}/acl.override").stat().st_size if Path(f"{DEF_CORE_DNS_DIR}/acl.override").exists() else 0),
                 },
                 "sniproxy_conf": {
                     "exists": Path(f"{DEF_PROXY_DIR}/sniproxy.conf").exists(),

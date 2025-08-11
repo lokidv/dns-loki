@@ -1,11 +1,12 @@
 . {
   log
   errors
-  cache 30
   reload
 
+  import /etc/coredns/acl.override
   import /etc/coredns/targets.override
   import /etc/coredns/v6block.override
+  cache 30
 
   forward . 1.1.1.1 1.0.0.1
 }
