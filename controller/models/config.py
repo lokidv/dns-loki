@@ -4,7 +4,7 @@ Configuration data models for DNS-Loki Controller
 
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from pydantic import BaseModel, Field, validator, HttpUrl
+from pydantic.v1 import BaseModel, Field, validator, HttpUrl
 
 
 class Flags(BaseModel):

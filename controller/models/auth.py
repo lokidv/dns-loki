@@ -4,7 +4,7 @@ Authentication and authorization models for DNS-Loki Controller
 
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field, EmailStr, validator
+from pydantic.v1 import BaseModel, Field, EmailStr, validator
 
 
 class User(BaseModel):
@@ -115,6 +115,25 @@ class APIKeyCreate(BaseModel):
     description: Optional[str] = None
     permissions: List[str] = Field(default_factory=list)
     expires_in_days: Optional[int] = Field(None, ge=1, le=365)
+
+
+class PasswordChange(BaseModel):
+    """Model for password change requests"""
+    old_password: str
+    new_password: str = Field(..., min_length=8)
+    
+    @validator('new_password')
+    def validate_new_password(cls, v):
+        """Validate new password strength"""
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+        return v
 
 
 class Session(BaseModel):
