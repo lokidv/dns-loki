@@ -94,9 +94,11 @@ install_coredns_native() {
     if apt-get update -y && apt-get install -y coredns; then
       echo "Installed CoreDNS from apt. Wiring configuration..."
       mkdir -p /etc/coredns
-      # Ensure override files are resolvable
+      # Ensure override files exist and are resolvable
+      touch /opt/dns-proxy/docker/dns/targets.override /opt/dns-proxy/docker/dns/v6block.override /opt/dns-proxy/docker/dns/acl.override
       ln -sf /opt/dns-proxy/docker/dns/targets.override /etc/coredns/targets.override
       ln -sf /opt/dns-proxy/docker/dns/v6block.override /etc/coredns/v6block.override
+      ln -sf /opt/dns-proxy/docker/dns/acl.override /etc/coredns/acl.override
       # Place our Corefile for the apt service
       cp -f /opt/dns-proxy/docker/dns/Corefile /etc/coredns/Corefile
       systemctl enable --now coredns
@@ -203,7 +205,7 @@ cp -f "${BASE_DIR}/docker/proxy/sniproxy.conf.tmpl" /opt/dns-proxy/docker/proxy/
 cp -f "${BASE_DIR}/nftables"/*.nft /opt/dns-proxy/nftables/ 2>/dev/null || true
 
 # Agent config
-cat >/opt/dns-proxy/agent/agent.yaml <<EOF
+cat >/opt/dns-proxy/agent/config.yaml <<EOF
 role: "$ROLE"          # controller|dns|proxy (agent only runs for dns/proxy)
 controller_url: "${CONTROLLER_URL}"
 git_repo: "${GIT_REPO}"
@@ -271,7 +273,7 @@ Requires=docker.service
 [Service]
 User=root
 WorkingDirectory=/opt/dns-proxy/agent
-ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/agent.yaml
+ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/config.yaml
 Restart=always
 RestartSec=2
 
@@ -293,6 +295,7 @@ RCF
   # Prepare CoreDNS runtime files
   touch /opt/dns-proxy/docker/dns/targets.override
   touch /opt/dns-proxy/docker/dns/v6block.override
+  touch /opt/dns-proxy/docker/dns/acl.override
   # Bring up DNS stack (try pulling from multiple registries first)
   try_pull_coredns || echo "Will attempt native CoreDNS."
   if (cd /opt/dns-proxy/docker/dns && docker compose up -d); then

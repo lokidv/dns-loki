@@ -406,7 +406,7 @@ sudo /opt/dns-proxy/agent/venv/bin/pip install --upgrade pip
 if [ -f /opt/dns-proxy/agent/requirements.txt ]; then sudo /opt/dns-proxy/agent/venv/bin/pip install -r /opt/dns-proxy/agent/requirements.txt; fi
 
 echo "[+] writing agent config"
-cat <<EOF | sudo tee /opt/dns-proxy/agent/config.yml >/dev/null
+cat <<EOF | sudo tee /opt/dns-proxy/agent/config.yaml >/dev/null
 role: "$ROLE"
 controller_url: "$CONTROLLER"
 EOF
@@ -420,7 +420,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/config.yml
+ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/config.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
