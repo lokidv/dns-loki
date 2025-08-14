@@ -1,3 +1,0 @@
-"""
-DNS-Loki Test Suite
-"""
