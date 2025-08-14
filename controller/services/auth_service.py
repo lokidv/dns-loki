@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import hashlib
 import secrets
-import jwt
+from jose import jwt
 from passlib.context import CryptContext
 
 from ..core.database import state_manager, cache_manager

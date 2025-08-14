@@ -162,3 +162,14 @@ logger_manager = LoggerManager()
 def get_logger(name: str) -> LoggerAdapter:
     """Get a logger instance for a module"""
     return logger_manager.get_logger(name)
+
+
+def setup_logging():
+    """Setup application logging - called at startup"""
+    logger_manager.setup_logging()
+    logger = get_logger(__name__)
+    logger.info("Logging system initialized")
+
+
+# Default logger for this module
+logger = get_logger(__name__)
