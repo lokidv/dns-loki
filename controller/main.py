@@ -1,7 +1,13 @@
 from fastapi import FastAPI
 
-from .core.exceptions import install_exception_handlers
-from .routers.monitoring import router as monitoring_router
+try:
+    # Package mode: e.g., `uvicorn controller.api:app`
+    from .core.exceptions import install_exception_handlers
+    from .routers.monitoring import router as monitoring_router
+except ImportError:
+    # Flat mode: e.g., `uvicorn api:app` with working dir `/opt/dns-proxy/controller`
+    from core.exceptions import install_exception_handlers
+    from routers.monitoring import router as monitoring_router
 
 
 def wire_routers(app: FastAPI) -> FastAPI:

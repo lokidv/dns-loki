@@ -6,16 +6,30 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
-from controller.core.exceptions import BadRequestError
-from controller.main import wire_routers
-from controller.services.domain_service import normalize_domains, normalize_domain
-from controller.services.code_update_service import perform_self_update, iter_codeload_zip
-from controller.services.git_service import github_zip_url
-from controller.services.nodes_service import (
-    upsert_node_in_state,
-    set_node_enabled,
-    NodeInModel,
-)
+try:
+    # When running as a proper package (e.g., uvicorn controller.api:app)
+    from controller.core.exceptions import BadRequestError
+    from controller.main import wire_routers
+    from controller.services.domain_service import normalize_domains, normalize_domain
+    from controller.services.code_update_service import perform_self_update, iter_codeload_zip
+    from controller.services.git_service import github_zip_url
+    from controller.services.nodes_service import (
+        upsert_node_in_state,
+        set_node_enabled,
+        NodeInModel,
+    )
+except ImportError:
+    # Fallback for flat-file installs (e.g., uvicorn api:app with files copied under /opt/dns-proxy/controller)
+    from core.exceptions import BadRequestError
+    from main import wire_routers
+    from services.domain_service import normalize_domains, normalize_domain
+    from services.code_update_service import perform_self_update, iter_codeload_zip
+    from services.git_service import github_zip_url
+    from services.nodes_service import (
+        upsert_node_in_state,
+        set_node_enabled,
+        NodeInModel,
+    )
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -260,7 +274,10 @@ def provision_proxy(req: ProvisionRequest, request: Request):
         code_repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
         code_branch = st.get("code_branch") or "main"
 
-    from controller.services.provisioning_service import provision_proxy as svc_provision
+    try:
+        from controller.services.provisioning_service import provision_proxy as svc_provision
+    except ImportError:
+        from services.provisioning_service import provision_proxy as svc_provision
 
     res = svc_provision(
         ip=req.ip,
@@ -296,7 +313,10 @@ def restart_node_services(ip: str, req: RestartRequest):
         raise BadRequestError("No valid services specified")
 
     # Delegate to service implementation
-    from controller.services.ssh_service import restart_services  # local import avoids circular deps
+    try:
+        from controller.services.ssh_service import restart_services  # local import avoids circular deps
+    except ImportError:
+        from services.ssh_service import restart_services  # flat-file fallback
 
     result = restart_services(
         ip=ip,

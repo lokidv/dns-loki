@@ -2,7 +2,12 @@ from typing import List, Optional
 import io
 import time
 import paramiko
-from controller.core.exceptions import RemoteExecutionError
+try:
+    # Package mode
+    from controller.core.exceptions import RemoteExecutionError
+except ImportError:
+    # Flat mode
+    from core.exceptions import RemoteExecutionError
 
 
 def restart_services(
