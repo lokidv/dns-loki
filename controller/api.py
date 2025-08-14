@@ -65,7 +65,7 @@ class ConfigOut(BaseModel):
     agents_version: int
     code_repo: str
     code_branch: str
-    enforce_dns_clients: bool = False
+    enforce_dns_clients: bool = True
     enforce_proxy_clients: bool = False
 
 class DomainsPayload(BaseModel):
@@ -114,7 +114,7 @@ def _load_state():
             "agents_version": 1,
             "code_repo": os.environ.get("CODE_REPO", "https://github.com/lokidv/dns-loki.git"),
             "code_branch": os.environ.get("CODE_BRANCH", "main"),
-            "enforce_dns_clients": False,
+            "enforce_dns_clients": True,
             "enforce_proxy_clients": False,
             "domains": [],
         }
@@ -130,7 +130,7 @@ def _load_state():
     st.setdefault("agents_version", 1)
     st.setdefault("code_repo", os.environ.get("CODE_REPO", "https://github.com/lokidv/dns-loki.git"))
     st.setdefault("code_branch", os.environ.get("CODE_BRANCH", "main"))
-    st.setdefault("enforce_dns_clients", False)
+    st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
     _save_state(st)
@@ -183,7 +183,7 @@ def get_flags():
     with LOCK:
         st = _load_state()
         return {
-            "enforce_dns_clients": bool(st.get("enforce_dns_clients", False)),
+            "enforce_dns_clients": bool(st.get("enforce_dns_clients", True)),
             "enforce_proxy_clients": bool(st.get("enforce_proxy_clients", False)),
         }
 
@@ -198,7 +198,7 @@ def set_flags(f: FlagsPayload):
             st["enforce_proxy_clients"] = bool(f.enforce_proxy_clients)
         _save_state(st)
         return {
-            "enforce_dns_clients": st.get("enforce_dns_clients", False),
+            "enforce_dns_clients": st.get("enforce_dns_clients", True),
             "enforce_proxy_clients": st.get("enforce_proxy_clients", False),
         }
 

@@ -234,22 +234,26 @@ def render_coredns_targets(domains, healthy_ips):
 
 def _ensure_acl_symlink():
     """برای CoreDNS native مسیر import را تضمین می‌کند.
-    اگر /etc/coredns/acl.override وجود ندارد، به فایل داخل دایرکتوری docker لینک می‌سازد.
+    برای سه فایل override (acl, targets, v6block) symlink می‌سازد تا Corefile بتواند import کند.
     بی‌خطر و idempotent است.
     """
     try:
         Path("/etc/coredns").mkdir(parents=True, exist_ok=True)
-        src = Path(f"{DEF_CORE_DNS_DIR}/acl.override")
-        dst = Path("/etc/coredns/acl.override")
-        # Always replace destination with a symlink to src (ln -sf semantics)
-        try:
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-        except Exception:
-            pass
-        os.symlink(src, dst)
+        for name in ("acl.override", "targets.override", "v6block.override"):
+            src = Path(f"{DEF_CORE_DNS_DIR}/{name}")
+            dst = Path(f"/etc/coredns/{name}")
+            # Always replace destination with a symlink to src (ln -sf semantics)
+            try:
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+            except Exception:
+                pass
+            try:
+                os.symlink(src, dst)
+            except Exception as e2:
+                log(f"override: ensure symlink failed for {name} -> {e2}")
     except Exception as e:
-        log(f"acl: ensure symlink failed -> {e}")
+        log(f"override: ensure symlink setup failed -> {e}")
 
 
 def render_v6block(domains):
@@ -390,11 +394,21 @@ def only_ipv4(ips):
 def nft_replace_set(set_name: str, ips):
     if not ips:
         # clear set
-        run(f"nft flush set inet filter {set_name}", check=False)
+        log(f"nft: clearing set {set_name} (no IPs provided)")
+        res = run(f"nft flush set inet filter {set_name}", check=False)
+        if res.returncode != 0:
+            log(f"nft: failed to flush {set_name} -> rc={res.returncode}")
         return
     elements = ", ".join(ips)
-    run(f"nft flush set inet filter {set_name}", check=False)
-    run(f"nft add element inet filter {set_name} {{ {elements} }}", check=False)
+    log(f"nft: updating set {set_name} with {len(ips)} IPs -> {elements}")
+    res1 = run(f"nft flush set inet filter {set_name}", check=False)
+    if res1.returncode != 0:
+        log(f"nft: failed to flush {set_name} -> rc={res1.returncode}")
+    res2 = run(f"nft add element inet filter {set_name} {{ {elements} }}", check=False)
+    if res2.returncode != 0:
+        log(f"nft: failed to add elements to {set_name} -> rc={res2.returncode}")
+    else:
+        log(f"nft: successfully updated {set_name} with {len(ips)} IPs")
 
 
 def nft_list_set(set_name: str):
@@ -512,8 +526,19 @@ def main():
         proxy_ips = [str(n["ip"]) for n in proxies]
         # DNS nodes (Iran) are the only legitimate callers of proxy servers
         dns_node_ips = [str(n["ip"]) for n in conf.get("nodes", []) if n.get("role") == "dns" and n.get("enabled", True)]
-        enforce_dns = conf.get("enforce_dns_clients", False)
+        enforce_dns = conf.get("enforce_dns_clients", True)
         enforce_proxy = conf.get("enforce_proxy_clients", False)
+        
+        # Log configuration details for debugging
+        log(f"config: role={role}, enforce_dns={enforce_dns}, enforce_proxy={enforce_proxy}")
+        log(f"config: total_clients={len(conf.get('clients', []))}, dns_clients={len(dns_clients)}, proxy_clients={len(proxy_clients)}")
+        log(f"config: total_nodes={len(conf.get('nodes', []))}, proxy_nodes={len(proxies)}, dns_nodes={len(dns_node_ips)}")
+        if dns_clients:
+            log(f"config: dns_clients_list -> {dns_clients}")
+        if proxy_clients:
+            log(f"config: proxy_clients_list -> {proxy_clients}")
+        if dns_node_ips:
+            log(f"config: dns_node_ips -> {dns_node_ips}")
 
         # Handle code update trigger for agents
         code_repo = conf.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
@@ -582,12 +607,16 @@ def main():
 
         healthy = []
         if role == "dns":
+            log(f"dns: applying policy -> enforce={enforce_dns}")
             apply_dns_policy(enforce_dns)
             # Update nft set of allowed dns clients
             if enforce_dns:
-                nft_replace_set("allow_dns_clients", only_ipv4(dns_clients))
+                ipv4_clients = only_ipv4(dns_clients)
+                log(f"dns: enforcement enabled, updating allowlist with {len(ipv4_clients)} clients -> {ipv4_clients}")
+                nft_replace_set("allow_dns_clients", ipv4_clients)
             else:
                 # When enforcement is disabled, clear the set to reflect runtime state
+                log("dns: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_dns_clients", [])
             # Health check proxies
             sni_host = domains[0].lstrip("*.")
@@ -615,14 +644,19 @@ def main():
             reload_coredns()
 
         if role == "proxy":
+            log(f"proxy: applying policy -> enforce={enforce_proxy}")
             apply_proxy_policy(enforce_proxy)
             # Update nft set of allowed proxy clients
             if enforce_proxy:
                 # Only allow Iran DNS nodes (required), plus any explicit proxy-scope clients (if defined)
                 allowed_proxy_clients = sorted(set(proxy_clients + dns_node_ips))
-                nft_replace_set("allow_proxy_clients", only_ipv4(allowed_proxy_clients))
+                ipv4_allowed = only_ipv4(allowed_proxy_clients)
+                log(f"proxy: enforcement enabled, updating allowlist with {len(ipv4_allowed)} clients -> {ipv4_allowed}")
+                log(f"proxy: allowlist breakdown -> proxy_clients={proxy_clients}, dns_nodes={dns_node_ips}")
+                nft_replace_set("allow_proxy_clients", ipv4_allowed)
             else:
                 # When enforcement is disabled, clear the set to reflect runtime state
+                log("proxy: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_proxy_clients", [])
             # Render sniproxy.conf from template
             conf_txt = render_sniproxy_conf(domains)

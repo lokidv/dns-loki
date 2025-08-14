@@ -211,7 +211,7 @@ git_branch: "${GIT_BRANCH}"
 work_dir: "/opt/dns-proxy"
 health_check_interval_seconds: 10
 # Enforcement toggles (set true later when ready to lock down)
-enforce_dns_clients: false
+enforce_dns_clients: true
 enforce_proxy_clients: false
 EOF
 
