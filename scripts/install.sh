@@ -196,11 +196,6 @@ cp -f "${BASE_DIR}/agent/agent.py" /opt/dns-proxy/agent/
 cp -f "${BASE_DIR}/agent/requirements.txt" /opt/dns-proxy/agent/
 cp -f "${BASE_DIR}/controller/api.py" /opt/dns-proxy/controller/ || true
 cp -f "${BASE_DIR}/controller/requirements.txt" /opt/dns-proxy/controller/ || true
-cp -f "${BASE_DIR}/controller/main.py" /opt/dns-proxy/controller/ 2>/dev/null || true
-mkdir -p /opt/dns-proxy/controller/{core,services,routers}
-cp -rf "${BASE_DIR}/controller/core/." /opt/dns-proxy/controller/core/ 2>/dev/null || true
-cp -rf "${BASE_DIR}/controller/services/." /opt/dns-proxy/controller/services/ 2>/dev/null || true
-cp -rf "${BASE_DIR}/controller/routers/." /opt/dns-proxy/controller/routers/ 2>/dev/null || true
 mkdir -p /opt/dns-proxy/controller/ui
 cp -rf "${BASE_DIR}/controller/ui/." /opt/dns-proxy/controller/ui/ 2>/dev/null || true
 cp -f "${BASE_DIR}/docker/dns/docker-compose.yml" /opt/dns-proxy/docker/dns/

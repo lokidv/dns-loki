@@ -1,35 +1,20 @@
 import os
 import json
 import threading
+import re
+import tempfile
+import shutil
+import zipfile
+import subprocess
+import time
+from urllib.request import urlopen
 from typing import List, Optional
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
-try:
-    # When running as a proper package (e.g., uvicorn controller.api:app)
-    from controller.core.exceptions import BadRequestError
-    from controller.main import wire_routers
-    from controller.services.domain_service import normalize_domains, normalize_domain
-    from controller.services.code_update_service import perform_self_update, iter_codeload_zip
-    from controller.services.git_service import github_zip_url
-    from controller.services.nodes_service import (
-        upsert_node_in_state,
-        set_node_enabled,
-        NodeInModel,
-    )
-except ImportError:
-    # Fallback for flat-file installs (e.g., uvicorn api:app with files copied under /opt/dns-proxy/controller)
-    from core.exceptions import BadRequestError
-    from main import wire_routers
-    from services.domain_service import normalize_domains, normalize_domain
-    from services.code_update_service import perform_self_update, iter_codeload_zip
-    from services.git_service import github_zip_url
-    from services.nodes_service import (
-        upsert_node_in_state,
-        set_node_enabled,
-        NodeInModel,
-    )
+import io
+import paramiko
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -43,7 +28,6 @@ app = FastAPI(title="DNS+SNI Control Plane")
 UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
 if os.path.isdir(UI_DIR):
     app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
-wire_routers(app)
 
 @app.get("/")
 def root():
@@ -230,16 +214,54 @@ def list_nodes():
 def upsert_node(n: NodeIn, request: Request):
     with LOCK:
         st = _load_state()
-        payload = NodeInModel(
-            ip=(str(n.ip) if n.ip is not None else None),
-            role=n.role,
-            enabled=n.enabled,
-            agents_version_applied=n.agents_version_applied,
-            ts=n.ts,
-            diag=n.diag,
-        )
-        req_ip = request.client.host if getattr(request, "client", None) else None
-        upsert_node_in_state(st, payload, req_ip or "0.0.0.0")
+        # Derive IP from payload or request if missing
+        ip_str = str(n.ip) if n.ip is not None else request.client.host
+        n_payload = {
+            "ip": ip_str,
+            "role": n.role,
+            "agents_version_applied": n.agents_version_applied,
+            "ts": n.ts,
+            "diag": n.diag,
+        }
+        found = False
+        for x in st["nodes"]:
+            if str(x["ip"]) == ip_str:
+                # Preserve existing values when incoming fields are None (avoid erasing)
+                old_diag = x.get("diag")
+                old_ver = x.get("agents_version_applied")
+                x.update(n_payload)
+                # Restore diag if missing in payload
+                if x.get("diag") is None and old_diag is not None:
+                    x["diag"] = old_diag
+                # Do not let agents_version_applied decrease due to stale heartbeats
+                incoming_ver = n_payload.get("agents_version_applied")
+                if incoming_ver is None:
+                    # keep previous when payload omits the field
+                    if old_ver is not None:
+                        x["agents_version_applied"] = old_ver
+                else:
+                    try:
+                        old_i = int(old_ver) if old_ver is not None else 0
+                    except Exception:
+                        old_i = 0
+                    try:
+                        inc_i = int(incoming_ver)
+                    except Exception:
+                        inc_i = old_i
+                    x["agents_version_applied"] = max(old_i, inc_i)
+                found = True
+        if not found:
+            # Defaults for new node records to avoid nulls in UI/state
+            if n_payload.get("agents_version_applied") is None:
+                n_payload["agents_version_applied"] = 0
+            if n_payload.get("diag") is None:
+                n_payload["diag"] = {}
+            # For a newly seen node, set enabled according to request if provided; otherwise default True
+            if n.enabled is None:
+                n_payload["enabled"] = True
+            else:
+                n_payload["enabled"] = bool(n.enabled)
+            st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]
 
@@ -248,7 +270,9 @@ def upsert_node(n: NodeIn, request: Request):
 def enable_node(ip: str):
     with LOCK:
         st = _load_state()
-        set_node_enabled(st, ip, True)
+        for x in st["nodes"]:
+            if str(x["ip"]) == ip:
+                x["enabled"] = True
         _save_state(st)
         return st["nodes"]
 
@@ -257,7 +281,9 @@ def enable_node(ip: str):
 def disable_node(ip: str):
     with LOCK:
         st = _load_state()
-        set_node_enabled(st, ip, False)
+        for x in st["nodes"]:
+            if str(x["ip"]) == ip:
+                x["enabled"] = False
         _save_state(st)
         return st["nodes"]
 
@@ -265,38 +291,185 @@ def disable_node(ip: str):
 # ===== Proxy Provisioning (SSH) =====
 @app.post("/v1/proxies/provision")
 def provision_proxy(req: ProvisionRequest, request: Request):
-    """Provision a remote host as Proxy node via SSH (thin controller endpoint).
-    Delegates to controller.services.provisioning_service and upserts node state.
+    """Provision a remote host as Proxy node via SSH.
+    Does NOT store credentials; executes a bootstrap script remotely.
     """
+    if not (req.ssh_password or req.ssh_key):
+        raise HTTPException(status_code=400, detail="Provide ssh_password or ssh_key")
+
     base_url = str(request.base_url).rstrip('/')
+
     with LOCK:
         st = _load_state()
+        # Read code repo settings (used by remote to download initial code via controller archive)
         code_repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
         code_branch = st.get("code_branch") or "main"
 
+    log_lines = []
+
+    def _log(s: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {s}"
+        log_lines.append(line)
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = None
+    if req.ssh_key:
+        _log("loading SSH private key")
+        try:
+            pkey = paramiko.RSAKey.from_private_key(io.StringIO(req.ssh_key))
+        except Exception:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(req.ssh_key))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {e}")
+
     try:
-        from controller.services.provisioning_service import provision_proxy as svc_provision
-    except ImportError:
-        from services.provisioning_service import provision_proxy as svc_provision
+        _log(f"connecting to {req.ip} as {req.ssh_user}")
+        client.connect(
+            hostname=req.ip,
+            username=req.ssh_user,
+            password=req.ssh_password,
+            pkey=pkey,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=15,
+        )
+        sftp = client.open_sftp()
+        try:
+            script = f"""#!/usr/bin/env bash
+set -euo pipefail
+CONTROLLER="{base_url}"
+CODE_REPO="{code_repo}"
+CODE_BRANCH="{code_branch}"
+ROLE="proxy"
 
-    res = svc_provision(
-        ip=req.ip,
-        ssh_user=req.ssh_user,
-        ssh_password=req.ssh_password,
-        ssh_key=req.ssh_key,
-        base_url=base_url,
-        code_repo=code_repo,
-        code_branch=code_branch,
-    )
+echo "[+] creating directories"
+sudo mkdir -p /opt/dns-proxy/agent /opt/dns-proxy/docker/proxy /opt/dns-proxy/domains
 
-    # Upsert node record optimistically as enabled proxy
-    with LOCK:
-        st = _load_state()
-        payload = NodeInModel(ip=req.ip, role="proxy", enabled=True)
-        upsert_node_in_state(st, payload, req.ip)
-        _save_state(st)
+echo "[+] installing prerequisites"
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -y
+  sudo apt-get install -y python3 python3-venv curl unzip ca-certificates
+  if {str(bool(True)).lower() if True else 'false'} && {str(bool(True)).lower()}; then
+    sudo apt-get install -y docker.io docker-compose-plugin || true
+  fi
+  # Ensure docker service is running on apt-based systems
+  # Try enabling docker if present; otherwise fallback to official install script
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[+] installing Docker via get.docker.com fallback"
+    curl -fsSL https://get.docker.com | sudo sh
+  fi
+  sudo systemctl enable --now docker || true
+  # Ensure docker compose availability (plugin or manual CLI plugin)
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "[+] installing docker compose CLI plugin manually"
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -SL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y python3 python3-venv curl unzip ca-certificates
+  sudo dnf install -y docker docker-compose || true
+  sudo systemctl enable --now docker || true
+  # Ensure docker compose availability; if missing, install CLI plugin manually
+  if ! docker compose version >/dev/null 2>&1; then
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    sudo curl -SL "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+else
+  echo "Unsupported package manager; install python3, venv, docker manually" >&2
+fi
 
-    return res
+echo "[+] verifying docker and compose versions"
+docker --version || true
+docker compose version || true
+
+echo "[+] fetching initial code archive from controller"
+TMPDIR=$(mktemp -d)
+curl -L "$CONTROLLER/v1/code/archive" -o "$TMPDIR/src.zip"
+unzip -q -o "$TMPDIR/src.zip" -d "$TMPDIR/src"
+ROOT=$(dirname $(dirname $(find "$TMPDIR/src" -type f -name agent.py | head -n1)))
+if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then echo "could not locate source root" >&2; exit 1; fi
+
+echo "[+] staging agent files and proxy docker files"
+sudo cp -f "$ROOT/agent/agent.py" /opt/dns-proxy/agent/agent.py
+if [ -f "$ROOT/agent/requirements.txt" ]; then sudo cp -f "$ROOT/agent/requirements.txt" /opt/dns-proxy/agent/requirements.txt; fi
+if [ -f "$ROOT/docker/proxy/docker-compose.yml" ]; then sudo cp -f "$ROOT/docker/proxy/docker-compose.yml" /opt/dns-proxy/docker/proxy/docker-compose.yml; fi
+if [ -f "$ROOT/docker/proxy/sniproxy.conf.tmpl" ]; then sudo cp -f "$ROOT/docker/proxy/sniproxy.conf.tmpl" /opt/dns-proxy/docker/proxy/sniproxy.conf.tmpl; fi
+
+echo "[+] creating python venv and installing agent requirements"
+sudo python3 -m venv /opt/dns-proxy/agent/venv
+sudo /opt/dns-proxy/agent/venv/bin/pip install --upgrade pip
+if [ -f /opt/dns-proxy/agent/requirements.txt ]; then sudo /opt/dns-proxy/agent/venv/bin/pip install -r /opt/dns-proxy/agent/requirements.txt; fi
+
+echo "[+] writing agent config"
+cat <<EOF | sudo tee /opt/dns-proxy/agent/config.yaml >/dev/null
+role: "$ROLE"
+controller_url: "$CONTROLLER"
+EOF
+
+echo "[+] installing systemd service"
+cat <<'EOF' | sudo tee /etc/systemd/system/dns-proxy-agent.service >/dev/null
+[Unit]
+Description=DNS Loki Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/dns-proxy/agent/venv/bin/python /opt/dns-proxy/agent/agent.py --config /opt/dns-proxy/agent/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dns-proxy-agent.service
+
+echo "[+] done"
+"""
+            _log("uploading bootstrap script")
+            with sftp.file("/tmp/provision_proxy.sh", "w") as f:
+                f.write(script)
+            sftp.chmod("/tmp/provision_proxy.sh", 0o755)
+        finally:
+            sftp.close()
+
+        _log("executing bootstrap script")
+        stdin, stdout, stderr = client.exec_command("sudo /tmp/provision_proxy.sh")
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            for line in out.splitlines():
+                _log("REMOTE: " + line)
+        if err:
+            for line in err.splitlines():
+                _log("REMOTE-ERR: " + line)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"Remote provisioning failed with code {rc}")
+
+        # Upsert node record optimistically
+        with LOCK:
+            st = _load_state()
+            ip_str = req.ip
+            exists = False
+            for x in st["nodes"]:
+                if str(x.get("ip")) == ip_str:
+                    x["role"] = "proxy"
+                    x["enabled"] = True
+                    exists = True
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 @app.post("/v1/nodes/{ip}/restart")
 def restart_node_services(ip: str, req: RestartRequest):
@@ -304,29 +477,137 @@ def restart_node_services(ip: str, req: RestartRequest):
     Does NOT store credentials; returns aggregated logs from remote execution.
     """
     if not (req.ssh_password or req.ssh_key):
-        raise BadRequestError("Provide ssh_password or ssh_key")
+        raise HTTPException(status_code=400, detail="Provide ssh_password or ssh_key")
 
-    # Validate requested services (optional: also done in service)
     services = [s.strip().lower() for s in (req.services or ["agent", "coredns", "sniproxy"]) if s]
     services = [s for s in services if s in {"agent", "coredns", "sniproxy"}]
     if not services:
-        raise BadRequestError("No valid services specified")
+        raise HTTPException(status_code=400, detail="No valid services specified")
 
-    # Delegate to service implementation
+    log_lines: List[str] = []
+
+    def _log(s: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_lines.append(f"[{ts}] {s}")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = None
+    if req.ssh_key:
+        _log("loading SSH private key")
+        try:
+            pkey = paramiko.RSAKey.from_private_key(io.StringIO(req.ssh_key))
+        except Exception:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(req.ssh_key))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {e}")
+
     try:
-        from controller.services.ssh_service import restart_services  # local import avoids circular deps
-    except ImportError:
-        from services.ssh_service import restart_services  # flat-file fallback
+        _log(f"connecting to {ip} as {req.ssh_user}")
+        client.connect(
+            hostname=str(ip),
+            username=req.ssh_user,
+            password=req.ssh_password,
+            pkey=pkey,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=15,
+        )
+        sftp = client.open_sftp()
+        try:
+            svc_list = " ".join(services)
+            script = f"""#!/usr/bin/env bash
+set -u
+echo "[+] requested services: {svc_list}"
 
-    result = restart_services(
-        ip=ip,
-        ssh_user=req.ssh_user,
-        ssh_password=req.ssh_password,
-        ssh_key=req.ssh_key,
-        services=services,
-    )
+SERVICES=({svc_list})
 
-    return result
+has_service() {{
+  local x
+  for x in "${{SERVICES[@]}}"; do [[ "$x" == "$1" ]] && return 0; done
+  return 1
+}}
+
+ensure_docker() {{
+  if command -v docker >/dev/null 2>&1; then
+    sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    return 0
+  fi
+  echo "[+] installing Docker via get.docker.com fallback"
+  curl -fsSL https://get.docker.com | sudo sh || true
+  sudo systemctl enable --now docker >/dev/null 2>&1 || true
+}}
+
+restart_compose_service() {{
+  local service="$1"
+  local tried=0
+  for f in \
+    /opt/dns-proxy/docker/dns/docker-compose.yml \
+    /opt/dns-proxy/docker/proxy/docker-compose.yml; do
+    if [ -f "$f" ]; then
+      tried=1
+      echo "[+] docker compose up -d $service using $f"
+      timeout 25s docker compose -f "$f" up -d "$service" >/dev/null 2>&1 || true
+      echo "[+] docker compose restart $service using $f"
+      timeout 20s docker compose -f "$f" restart "$service" >/dev/null 2>&1 || true
+    fi
+  done
+  if [ "$tried" = "0" ]; then
+    echo "[!] compose file not found for $service, trying 'docker restart'"
+  fi
+  timeout 15s docker restart "$service" >/dev/null 2>&1 || true
+  docker ps --format '{{.Names}}\t{{.Status}}' | grep -E "^$service\b" || true
+}}
+
+if has_service agent; then
+  echo "[+] restarting agent via systemd"
+  sudo systemctl restart dns-proxy-agent || true
+  sudo systemctl is-active dns-proxy-agent || true
+fi
+
+if has_service coredns || has_service sniproxy; then
+  ensure_docker
+fi
+
+if has_service coredns; then
+  echo "[+] restarting coredns (docker)"
+  restart_compose_service coredns
+fi
+
+if has_service sniproxy; then
+  echo "[+] restarting sniproxy (docker)"
+  restart_compose_service sniproxy
+fi
+
+echo "[+] done"
+"""
+            _log("uploading restart script")
+            with sftp.file("/tmp/restart_services.sh", "w") as f:
+                f.write(script)
+            sftp.chmod("/tmp/restart_services.sh", 0o755)
+        finally:
+            sftp.close()
+
+        _log("executing restart script")
+        stdin, stdout, stderr = client.exec_command("sudo /tmp/restart_services.sh")
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            for line in out.splitlines():
+                _log("REMOTE: " + line)
+        if err:
+            for line in err.splitlines():
+                _log("REMOTE-ERR: " + line)
+        # Do not fail hard to allow log visibility even if a service failed
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    return {"ok": True, "services": services, "log": "\n".join(log_lines)}
 
 @app.post("/v1/domains/sync")
 def bump_domains_version():
@@ -347,8 +628,19 @@ def get_domains():
 def set_domains(payload: DomainsPayload):
     with LOCK:
         st = _load_state()
-        # normalize and deduplicate via service helper
-        st["domains"] = normalize_domains(payload.domains)
+        # normalize and deduplicate
+        items = []
+        seen = set()
+        for d in payload.domains:
+            d = str(d).strip().lower()
+            if not d:
+                continue
+            if d.startswith("*."):
+                d = d[2:]
+            if d not in seen:
+                seen.add(d)
+                items.append(d)
+        st["domains"] = items
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
         _save_state(st)
         return st["domains"]
@@ -357,7 +649,9 @@ def set_domains(payload: DomainsPayload):
 def add_domain(item: DomainItem):
     with LOCK:
         st = _load_state()
-        d = normalize_domain(item.domain)
+        d = str(item.domain).strip().lower()
+        if d.startswith("*."):
+            d = d[2:]
         if d and d not in st.get("domains", []):
             st["domains"].append(d)
             st["domains_version"] = int(st.get("domains_version", 1)) + 1
@@ -368,14 +662,33 @@ def add_domain(item: DomainItem):
 def delete_domain(domain: str):
     with LOCK:
         st = _load_state()
-        d = normalize_domain(domain)
+        d = str(domain).strip().lower()
+        if d.startswith("*."):
+            d = d[2:]
         st["domains"] = [x for x in st.get("domains", []) if x != d]
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
         _save_state(st)
         return st.get("domains", [])
 
 
-# (duplicate /v1/flags block removed; original is defined earlier via FlagsPayload)
+class Flags(BaseModel):
+    enforce_dns_clients: Optional[bool] = None
+    enforce_proxy_clients: Optional[bool] = None
+
+
+@app.post("/v1/flags")
+def set_flags(flags: Flags):
+    with LOCK:
+        st = _load_state()
+        if flags.enforce_dns_clients is not None:
+            st["enforce_dns_clients"] = bool(flags.enforce_dns_clients)
+        if flags.enforce_proxy_clients is not None:
+            st["enforce_proxy_clients"] = bool(flags.enforce_proxy_clients)
+        _save_state(st)
+        return {
+            "enforce_dns_clients": st["enforce_dns_clients"],
+            "enforce_proxy_clients": st["enforce_proxy_clients"],
+        }
 
 # Optional: set git_repo and git_branch via API
 class GitSettings(BaseModel):
@@ -406,11 +719,37 @@ class AgentsVersionPayload(BaseModel):
 
 
 def _github_zip_url(repo_url: str, branch: str) -> Optional[str]:
-    return github_zip_url(repo_url, branch)
+    # پشتیبانی از حالت‌های متداول URL گیت‌هاب:
+    # - https://github.com/owner/repo.git
+    # - https://github.com/owner/repo
+    # - http://github.com/owner/repo(.git)
+    # - git@github.com:owner/repo(.git)
+    if not repo_url:
+        return None
+    s = repo_url.strip()
+    # تطبیق حالت SSH مانند git@github.com:owner/repo(.git)
+    m_ssh = re.match(r"git@github\.com:([^/]+)/([^/]+)(?:\.git)?$", s)
+    if m_ssh:
+        owner, repo = m_ssh.group(1), m_ssh.group(2)
+        return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+
+    # تطبیق حالت‌های http/https با/بدون www و با/بدون .git
+    m_http = re.search(r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)", s)
+    if not m_http:
+        return None
+    owner, repo = m_http.group(1), m_http.group(2)
+    repo = repo[:-4] if repo.endswith('.git') else repo
+    return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
 def _copy_tree(src: str, dst: str):
-    copy_tree(src, dst)
+    os.makedirs(dst, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = os.path.join(dst, rel) if rel != "." else dst
+        os.makedirs(target_root, exist_ok=True)
+        for f in files:
+            shutil.copy2(os.path.join(root, f), os.path.join(target_root, f))
 
 
 @app.post("/v1/code")
@@ -467,7 +806,7 @@ def set_agents_version(payload: AgentsVersionPayload):
             try:
                 st["agents_version"] = int(payload.agents_version)
             except Exception:
-                raise BadRequestError("invalid agents_version")
+                raise HTTPException(status_code=400, detail="invalid agents_version")
         else:
             st["agents_version"] = int(st.get("agents_version", 1)) + 1
         _save_state(st)
@@ -501,7 +840,61 @@ def self_update_controller():
         st = _load_state()
         repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
         branch = st.get("code_branch") or "main"
-    return perform_self_update(repo, branch)
+
+    url = _github_zip_url(repo, branch)
+    if not url:
+        raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
+
+    tmpdir = tempfile.mkdtemp(prefix="dns_loki_upd_")
+    zip_path = os.path.join(tmpdir, "src.zip")
+    try:
+        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmpdir)
+        # find extracted root (robust for any repo name)
+        root = None
+        for name in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, name)
+            if os.path.isdir(p):
+                # prefer a directory that contains controller/api.py
+                if os.path.exists(os.path.join(p, "controller", "api.py")):
+                    root = p
+                    break
+                if root is None:
+                    root = p
+        if not root:
+            raise HTTPException(status_code=500, detail="Cannot locate extracted source root (zip format unexpected)")
+
+        # copy controller files
+        shutil.copy2(os.path.join(root, "controller", "api.py"), "/opt/dns-proxy/controller/api.py")
+        if os.path.exists(os.path.join(root, "controller", "requirements.txt")):
+            shutil.copy2(os.path.join(root, "controller", "requirements.txt"), "/opt/dns-proxy/controller/requirements.txt")
+        # copy UI
+        ui_src = os.path.join(root, "controller", "ui")
+        if os.path.isdir(ui_src):
+            if os.path.isdir("/opt/dns-proxy/controller/ui"):
+                shutil.rmtree("/opt/dns-proxy/controller/ui")
+            _copy_tree(ui_src, "/opt/dns-proxy/controller/ui")
+        # upgrade controller deps
+        try:
+            subprocess.run([
+                "/opt/dns-proxy/controller/venv/bin/pip", "install", "-r", "/opt/dns-proxy/controller/requirements.txt"
+            ], check=False)
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # restart controller in background after short delay
+    try:
+        subprocess.Popen([
+            "bash", "-lc", "sleep 1; systemctl restart dns-proxy-controller"
+        ])
+    except Exception:
+        pass
+
+    return {"ok": True, "restarting": True}
 
 
 @app.get("/v1/code/archive")
@@ -513,15 +906,18 @@ def get_code_archive(repo: Optional[str] = None, branch: Optional[str] = None):
         st = _load_state()
         repo_url = repo or st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
         br = branch or st.get("code_branch") or "main"
-
-    # Upfront input validation to avoid streaming errors
-    if github_zip_url(repo_url, br) is None:
-        raise BadRequestError("Unsupported repo URL (only GitHub is supported)")
+    url = _github_zip_url(repo_url, br)
+    if not url:
+        raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
 
     def _iter():
         try:
-            for chunk in iter_codeload_zip(repo_url, br):
-                yield chunk
+            with urlopen(url, timeout=45) as resp:
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    yield chunk
         except Exception:
             # propagate as empty stream to client; they'll handle failure
             return
