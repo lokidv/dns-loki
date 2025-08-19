@@ -6,12 +6,18 @@ BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Universal installer for DNS/Proxy nodes and Controller
 # Usage examples:
 #  - Controller: sudo ./scripts/install.sh --role controller --bind 0.0.0.0:8080
-#  - DNS node:   sudo ./scripts/install.sh --role dns --controller-url http://<controller_ip>:8080 --git-repo <repo_url> --git-branch main
+#  - DNS node (legacy single URL):
+#       sudo ./scripts/install.sh --role dns --controller-url http://<controller_ip>:8080 \
+#            --git-repo <repo_url> --git-branch main
+#  - DNS node (multi-controller HA):
+#       sudo ./scripts/install.sh --role dns --controller-urls http://10.0.0.10:8080,http://10.0.0.11:8080 \
+#            --git-repo <repo_url> --git-branch main
 #  - Proxy node: sudo ./scripts/install.sh --role proxy --controller-url http://<controller_ip>:8080 --git-repo <repo_url> --git-branch main
 
 ROLE=""
 BIND="0.0.0.0:8080"
 CONTROLLER_URL=""
+CONTROLLER_URLS=""
 GIT_REPO=""
 GIT_BRANCH="main"
 COREDNS_VERSION="v1.11.1"
@@ -24,6 +30,8 @@ while [[ $# -gt 0 ]]; do
       BIND="$2"; shift 2;;
     --controller-url)
       CONTROLLER_URL="$2"; shift 2;;
+    --controller-urls)
+      CONTROLLER_URLS="$2"; shift 2;;
     --git-repo)
       GIT_REPO="$2"; shift 2;;
     --git-branch)
@@ -205,9 +213,25 @@ cp -f "${BASE_DIR}/docker/proxy/sniproxy.conf.tmpl" /opt/dns-proxy/docker/proxy/
 cp -f "${BASE_DIR}/nftables"/*.nft /opt/dns-proxy/nftables/ 2>/dev/null || true
 
 # Agent config
-cat >/opt/dns-proxy/agent/config.yaml <<EOF
+{
+  cat >/opt/dns-proxy/agent/config.yaml <<EOF
 role: "$ROLE"          # controller|dns|proxy (agent only runs for dns/proxy)
-controller_url: "${CONTROLLER_URL}"
+EOF
+  if [[ -n "$CONTROLLER_URLS" ]]; then
+    echo "controller_urls:" >>/opt/dns-proxy/agent/config.yaml
+    # Support comma-separated list passed to --controller-urls
+    IFS=',' read -ra __ARR <<<"$CONTROLLER_URLS"
+    for u in "${__ARR[@]}"; do
+      u_trim="${u//\n/}"
+      u_trim="${u_trim//\r/}"
+      u_trim="${u_trim//[[:space:]]/}"
+      [[ -n "$u_trim" ]] && echo "- \"$u_trim\"" >>/opt/dns-proxy/agent/config.yaml
+    done
+  else
+    # Fallback to single URL (can itself be comma-separated; agent handles it)
+    echo "controller_url: \"${CONTROLLER_URL}\"" >>/opt/dns-proxy/agent/config.yaml
+  fi
+  cat >>/opt/dns-proxy/agent/config.yaml <<EOF
 git_repo: "${GIT_REPO}"
 git_branch: "${GIT_BRANCH}"
 work_dir: "/opt/dns-proxy"
@@ -216,6 +240,7 @@ health_check_interval_seconds: 10
 enforce_dns_clients: true
 enforce_proxy_clients: false
 EOF
+}
 
 # Ensure nftables is enabled
 systemctl enable --now nftables

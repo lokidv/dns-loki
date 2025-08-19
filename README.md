@@ -39,7 +39,41 @@ nft -f /opt/dns-proxy/nftables/dns_enforced.nft
 nft list chain inet filter input
 nft list set inet filter allow_dns_clients
 
+## Multi-Controller Agent Fallback (HA)
 
+ایجنت از چند URL کنترلر پشتیبانی می‌کند و به ترتیب اولویت، در هر چرخه اولین کنترلری که پاسخ دهد را انتخاب می‌کند (Failover خودکار).
+
+- **تنظیم در فایل کانفیگ `agent/config.yaml`:**
+  - لیست YAML:
+    ```yaml
+    controller_urls:
+      - "http://10.0.0.10:8080"
+      - "http://10.0.0.11:8080"
+    ```
+  - یا رشتهٔ کاما-جدا (سازگاری قدیمی):
+    ```yaml
+    controller_url: "http://10.0.0.10:8080,http://10.0.0.11:8080"
+    ```
+
+- **نصب با اسکریپت (`scripts/install.sh`):**
+  - تک URL (قدیمی):
+    ```bash
+    sudo ./scripts/install.sh --role dns \
+      --controller-url http://10.0.0.10:8080 --git-repo <repo> --git-branch main
+    ```
+  - چند URL (HA):
+    ```bash
+    sudo ./scripts/install.sh --role dns \
+      --controller-urls http://10.0.0.10:8080,http://10.0.0.11:8080 \
+      --git-repo <repo> --git-branch main
+    ```
+
+- **رفتار:**
+  - هر چرخه، ایجنت `controller_urls` را به ترتیب تست می‌کند و «پایهٔ فعال» (`active_base`) را انتخاب می‌کند.
+  - تمام درخواست‌ها (Config، Domains، Heartbeat/ثبت نود، گزارش بروزرسانی) به `active_base` ارسال می‌شوند.
+  - در صورت مسدود بودن GitHub، دانلود کُد از مسیر پروکسی کنترلر `GET {active_base}/v1/code/archive` انجام می‌شود.
+  - ترتیب URLها نشان‌دهندهٔ اولویت است. سازگاری با `controller_url` حفظ شده است.
+  - می‌توانید به‌جای چند URL از VIP/Load Balancer هم استفاده کنید.
 
 # 1) بکاپ از فایل‌های زنده‌ی کنترلر
 mkdir -p /opt/dns-proxy/backup/controller-$(date +%F-%H%M)

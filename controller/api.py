@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
 import io
 import paramiko
+import requests
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -28,6 +29,11 @@ app = FastAPI(title="DNS+SNI Control Plane")
 UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
 if os.path.isdir(UI_DIR):
     app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
+
+# Resolve self base URL from environment (used for controller clustering/replication)
+_HOST_ENV = os.environ.get("HOST", "127.0.0.1")
+_PORT_ENV = os.environ.get("PORT", "8080")
+SELF_BASE_URL = f"http://{_HOST_ENV}:{_PORT_ENV}"
 
 @app.get("/")
 def root():
@@ -94,6 +100,20 @@ class RestartRequest(BaseModel):
     services: Optional[List[str]] = None  # e.g., ["agent", "coredns", "sniproxy"]
 
 
+class JoinRequest(BaseModel):
+    base_url: str  # e.g., http://10.0.0.11:8080
+    bidirectional: Optional[bool] = True
+
+
+class PromoteControllerRequest(BaseModel):
+    ip: str
+    ssh_user: str
+    ssh_password: Optional[str] = None
+    ssh_key: Optional[str] = None
+    port: int = 8080
+    install_docker: bool = False  # controller itself does not require docker
+
+
 def _load_state():
     os.makedirs(DATA_DIR, exist_ok=True)
     # Try read existing state; tolerate corruption and rebuild with defaults
@@ -117,6 +137,8 @@ def _load_state():
             "enforce_dns_clients": True,
             "enforce_proxy_clients": False,
             "domains": [],
+            "controllers": [],  # list of peer controller base URLs, e.g., http://10.0.0.10:8080
+            "state_rev": 1,     # monotonically increasing revision for last-writer-wins replication
         }
         with open(STATE_PATH, "w") as f:
             json.dump(st, f)
@@ -133,6 +155,8 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
+    st.setdefault("controllers", [])
+    st.setdefault("state_rev", 1)
     _save_state(st)
     return st
 
@@ -140,6 +164,41 @@ def _load_state():
 def _save_state(st):
     with open(STATE_PATH, "w") as f:
         json.dump(st, f, indent=2)
+
+
+def _replicate_to_peers(st: dict):
+    peers = st.get("controllers", []) or []
+    my_url = (SELF_BASE_URL or "").rstrip("/")
+    payload = {
+        "state": st,
+        "state_rev": int(st.get("state_rev", 1) or 1),
+    }
+    headers = {"Content-Type": "application/json"}
+    for url in peers:
+        try:
+            u = str(url or "").strip().rstrip("/")
+            if not u:
+                continue
+            if u == my_url:
+                continue
+            requests.post(f"{u}/v1/cluster/replicate", json=payload, headers=headers, timeout=3)
+        except Exception:
+            # best-effort; ignore failures
+            pass
+
+
+def _save_and_replicate(st: dict):
+    # bump state revision and persist, then best-effort replicate
+    try:
+        cur = int(st.get("state_rev", 1) or 1)
+    except Exception:
+        cur = 1
+    st["state_rev"] = cur + 1
+    _save_state(st)
+    try:
+        _replicate_to_peers(st)
+    except Exception:
+        pass
 
 
 @app.get("/v1/config", response_model=ConfigOut)
@@ -165,7 +224,7 @@ def add_client(c: Client):
         # Ensure JSON-serializable payload (ip as string)
         payload = json.loads(c.json())
         st["clients"].append(payload)
-        _save_state(st)
+        _save_and_replicate(st)
         return st["clients"]
 
 
@@ -174,7 +233,7 @@ def del_client(ip: str):
     with LOCK:
         st = _load_state()
         st["clients"] = [x for x in st["clients"] if str(x["ip"]) != ip]
-        _save_state(st)
+        _save_and_replicate(st)
         return st["clients"]
 
 
@@ -196,7 +255,7 @@ def set_flags(f: FlagsPayload):
             st["enforce_dns_clients"] = bool(f.enforce_dns_clients)
         if f.enforce_proxy_clients is not None:
             st["enforce_proxy_clients"] = bool(f.enforce_proxy_clients)
-        _save_state(st)
+        _save_and_replicate(st)
         return {
             "enforce_dns_clients": st.get("enforce_dns_clients", True),
             "enforce_proxy_clients": st.get("enforce_proxy_clients", False),
@@ -262,7 +321,7 @@ def upsert_node(n: NodeIn, request: Request):
             else:
                 n_payload["enabled"] = bool(n.enabled)
             st["nodes"].append(n_payload)
-        _save_state(st)
+        _save_and_replicate(st)
         return st["nodes"]
 
 
@@ -273,7 +332,7 @@ def enable_node(ip: str):
         for x in st["nodes"]:
             if str(x["ip"]) == ip:
                 x["enabled"] = True
-        _save_state(st)
+        _save_and_replicate(st)
         return st["nodes"]
 
 
@@ -284,7 +343,7 @@ def disable_node(ip: str):
         for x in st["nodes"]:
             if str(x["ip"]) == ip:
                 x["enabled"] = False
-        _save_state(st)
+        _save_and_replicate(st)
         return st["nodes"]
 
 
@@ -304,6 +363,18 @@ def provision_proxy(req: ProvisionRequest, request: Request):
         # Read code repo settings (used by remote to download initial code via controller archive)
         code_repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
         code_branch = st.get("code_branch") or "main"
+        # Build controller URL list for agent config (self first, then peers)
+        ctrl_candidates = [base_url]
+        for u in (st.get("controllers") or []):
+            try:
+                s = str(u or "").strip().rstrip('/')
+            except Exception:
+                s = ""
+            if s and s not in ctrl_candidates:
+                ctrl_candidates.append(s)
+        # Render peers (excluding self) as YAML list items for insertion into here-doc
+        peers_only = [u for u in ctrl_candidates if u != base_url]
+        peers_yaml_lines = "".join([f"  - \"{u}\"\n" for u in peers_only])
 
     log_lines = []
 
@@ -409,6 +480,9 @@ echo "[+] writing agent config"
 cat <<EOF | sudo tee /opt/dns-proxy/agent/config.yaml >/dev/null
 role: "$ROLE"
 controller_url: "$CONTROLLER"
+controller_urls:
+  - "$CONTROLLER"
+{peers_yaml_lines}
 EOF
 
 echo "[+] installing systemd service"
@@ -614,7 +688,7 @@ def bump_domains_version():
     with LOCK:
         st = _load_state()
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
-        _save_state(st)
+        _save_and_replicate(st)
         return {"domains_version": st["domains_version"]}
 
 # Domains CRUD API (store in controller state; Agent can consume directly if git_repo is empty)
@@ -642,7 +716,7 @@ def set_domains(payload: DomainsPayload):
                 items.append(d)
         st["domains"] = items
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
-        _save_state(st)
+        _save_and_replicate(st)
         return st["domains"]
 
 @app.post("/v1/domains/add", response_model=List[str])
@@ -655,7 +729,7 @@ def add_domain(item: DomainItem):
         if d and d not in st.get("domains", []):
             st["domains"].append(d)
             st["domains_version"] = int(st.get("domains_version", 1)) + 1
-            _save_state(st)
+            _save_and_replicate(st)
         return st.get("domains", [])
 
 @app.delete("/v1/domains/{domain}", response_model=List[str])
@@ -667,7 +741,7 @@ def delete_domain(domain: str):
             d = d[2:]
         st["domains"] = [x for x in st.get("domains", []) if x != d]
         st["domains_version"] = int(st.get("domains_version", 1)) + 1
-        _save_state(st)
+        _save_and_replicate(st)
         return st.get("domains", [])
 
 
@@ -684,7 +758,7 @@ def set_flags(flags: Flags):
             st["enforce_dns_clients"] = bool(flags.enforce_dns_clients)
         if flags.enforce_proxy_clients is not None:
             st["enforce_proxy_clients"] = bool(flags.enforce_proxy_clients)
-        _save_state(st)
+        _save_and_replicate(st)
         return {
             "enforce_dns_clients": st["enforce_dns_clients"],
             "enforce_proxy_clients": st["enforce_proxy_clients"],
@@ -704,7 +778,7 @@ def set_git(settings: GitSettings):
             st["git_repo"] = settings.git_repo
         if settings.git_branch is not None:
             st["git_branch"] = settings.git_branch
-        _save_state(st)
+        _save_and_replicate(st)
         return {"git_repo": st["git_repo"], "git_branch": st["git_branch"]}
 
 # ===== Code update management =====
@@ -760,7 +834,7 @@ def set_code_repo(settings: CodeSettings):
             st["code_repo"] = settings.code_repo
         if settings.code_branch is not None:
             st["code_branch"] = settings.code_branch
-        _save_state(st)
+        _save_and_replicate(st)
         return {"code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 
 
@@ -782,7 +856,7 @@ def update_nodes(settings: CodeSettings = None):
                 cur_i = 0
             node["agents_version_applied"] = cur_i + 1
             updated += 1
-        _save_state(st)
+        _save_and_replicate(st)
         return {
             "updated_nodes": updated,
             "agents_version": st.get("agents_version", 1),
@@ -809,7 +883,7 @@ def set_agents_version(payload: AgentsVersionPayload):
                 raise HTTPException(status_code=400, detail="invalid agents_version")
         else:
             st["agents_version"] = int(st.get("agents_version", 1)) + 1
-        _save_state(st)
+        _save_and_replicate(st)
         return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 
 
@@ -825,12 +899,227 @@ def force_reset_agents():
             node["agents_version_applied"] = 0
         # Bump target version to force update
         st["agents_version"] = int(st.get("agents_version", 1)) + 1
-        _save_state(st)
+        _save_and_replicate(st)
         return {
             "message": "All agents reset and target version bumped",
             "agents_version": st["agents_version"],
             "reset_nodes": len(st["nodes"])
         }
+
+# ===== Controller clustering =====
+@app.post("/v1/controllers/join")
+def join_controller(req: JoinRequest, request: Request):
+    peer = (req.base_url or "").strip().rstrip("/")
+    if not peer:
+        raise HTTPException(status_code=400, detail="invalid base_url")
+    with LOCK:
+        st = _load_state()
+        ctrls = [str(x).strip().rstrip("/") for x in (st.get("controllers") or []) if str(x).strip()]
+        my_url = str(SELF_BASE_URL).strip().rstrip("/")
+        changed = False
+        if my_url and my_url not in ctrls:
+            ctrls.append(my_url)
+            changed = True
+        if peer not in ctrls:
+            ctrls.append(peer)
+            changed = True
+        st["controllers"] = ctrls
+        if changed:
+            _save_and_replicate(st)
+    # Bidirectional join and initial state push (best-effort)
+    if req.bidirectional:
+        try:
+            requests.post(f"{peer}/v1/controllers/join", json={"base_url": SELF_BASE_URL, "bidirectional": False}, timeout=4)
+        except Exception:
+            pass
+    # Push our current state to the peer for convergence
+    try:
+        with LOCK:
+            cur = _load_state()
+            payload = {"state": cur, "state_rev": int(cur.get("state_rev", 1) or 1)}
+        requests.post(f"{peer}/v1/cluster/replicate", json=payload, timeout=4)
+    except Exception:
+        pass
+    return {"ok": True, "peer": peer}
+
+
+@app.post("/v1/cluster/replicate")
+def cluster_replicate(payload: dict, request: Request = None):
+    if not isinstance(payload, dict) or "state" not in payload or "state_rev" not in payload:
+        raise HTTPException(status_code=400, detail="invalid payload")
+    incoming_state = payload.get("state")
+    try:
+        incoming_rev = int(payload.get("state_rev", 0) or 0)
+    except Exception:
+        incoming_rev = 0
+    if not isinstance(incoming_state, dict):
+        raise HTTPException(status_code=400, detail="invalid state")
+    with LOCK:
+        local = _load_state()
+        local_rev = int(local.get("state_rev", 1) or 1)
+        applied = False
+        if incoming_rev > local_rev:
+            # Merge controllers (union), ensure SELF_BASE_URL present
+            inc_ctrls = [str(x).strip().rstrip("/") for x in (incoming_state.get("controllers") or []) if str(x).strip()]
+            loc_ctrls = [str(x).strip().rstrip("/") for x in (local.get("controllers") or []) if str(x).strip()]
+            merged_ctrls = []
+            for x in inc_ctrls + loc_ctrls + [SELF_BASE_URL]:
+                x = str(x or "").strip().rstrip("/")
+                if x and x not in merged_ctrls:
+                    merged_ctrls.append(x)
+            incoming_state["controllers"] = merged_ctrls
+            # Persist without re-replication to avoid loops
+            _save_state(incoming_state)
+            applied = True
+        return {"ok": True, "applied": applied, "local_rev": local_rev, "incoming_rev": incoming_rev}
+
+
+@app.post("/v1/controllers/promote")
+def promote_controller(req: PromoteControllerRequest, request: Request):
+    if not (req.ssh_password or req.ssh_key):
+        raise HTTPException(status_code=400, detail="Provide ssh_password or ssh_key")
+    base_url = str(request.base_url).rstrip('/')
+    log_lines: List[str] = []
+
+    def _log(s: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_lines.append(f"[{ts}] {s}")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = None
+    if req.ssh_key:
+        _log("loading SSH private key")
+        try:
+            pkey = paramiko.RSAKey.from_private_key(io.StringIO(req.ssh_key))
+        except Exception:
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(req.ssh_key))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {e}")
+
+    try:
+        _log(f"connecting to {req.ip} as {req.ssh_user}")
+        client.connect(
+            hostname=req.ip,
+            username=req.ssh_user,
+            password=req.ssh_password,
+            pkey=pkey,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=20,
+        )
+        sftp = client.open_sftp()
+        try:
+            script = f"""#!/usr/bin/env bash
+set -euo pipefail
+CONTROLLER="{base_url}"
+PORT="{req.port}"
+HOST_IP="{req.ip}"
+
+echo "[+] creating directories"
+sudo mkdir -p /opt/dns-proxy/controller /opt/dns-proxy/data
+
+echo "[+] installing prerequisites"
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -y
+  sudo apt-get install -y python3 python3-venv curl unzip ca-certificates
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y python3 python3-venv curl unzip ca-certificates
+else
+  echo "Unsupported package manager; install python3, venv manually" >&2
+fi
+
+echo "[+] fetching code archive from controller"
+TMPDIR=$(mktemp -d)
+curl -fsSL "$CONTROLLER/v1/code/archive" -o "$TMPDIR/src.zip"
+unzip -q -o "$TMPDIR/src.zip" -d "$TMPDIR/src"
+ROOT=$(dirname $(dirname $(find "$TMPDIR/src" -type f -path "*/controller/api.py" | head -n1)))
+if [ -z "$ROOT" ] || [ ! -d "$ROOT/controller" ]; then echo "could not locate controller source" >&2; exit 1; fi
+
+echo "[+] staging controller files"
+sudo rsync -a "$ROOT/controller/" /opt/dns-proxy/controller/
+
+echo "[+] creating python venv and installing requirements"
+sudo python3 -m venv /opt/dns-proxy/controller/venv
+sudo /opt/dns-proxy/controller/venv/bin/pip install --upgrade pip
+if [ -f /opt/dns-proxy/controller/requirements.txt ]; then sudo /opt/dns-proxy/controller/venv/bin/pip install -r /opt/dns-proxy/controller/requirements.txt; fi
+
+echo "[+] writing systemd service"
+cat <<EOF | sudo tee /etc/systemd/system/dns-loki-controller.service >/dev/null
+[Unit]
+Description=DNS Loki Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DATA_DIR=/opt/dns-proxy/data
+Environment=HOST=$HOST_IP
+Environment=PORT=$PORT
+WorkingDirectory=/opt/dns-proxy/controller
+ExecStart=/opt/dns-proxy/controller/venv/bin/uvicorn controller.api:app --host 0.0.0.0 --port $PORT
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dns-loki-controller.service
+
+echo "[+] done"
+"""
+            _log("uploading controller promotion script")
+            with sftp.file("/tmp/promote_controller.sh", "w") as f:
+                f.write(script)
+            sftp.chmod("/tmp/promote_controller.sh", 0o755)
+        finally:
+            sftp.close()
+
+        _log("executing promotion script")
+        stdin, stdout, stderr = client.exec_command("sudo /tmp/promote_controller.sh")
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        rc = stdout.channel.recv_exit_status()
+        if out:
+            for line in out.splitlines():
+                _log("REMOTE: " + line)
+        if err:
+            for line in err.splitlines():
+                _log("REMOTE-ERR: " + line)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"Remote promotion failed with code {rc}")
+
+        peer_url = f"http://{req.ip}:{req.port}"
+        # Record peer locally and replicate
+        with LOCK:
+            st = _load_state()
+            ctrls = [str(x).strip().rstrip("/") for x in (st.get("controllers") or []) if str(x).strip()]
+            if peer_url not in ctrls:
+                ctrls.append(peer_url)
+                st["controllers"] = ctrls
+                _save_and_replicate(st)
+        # Ask peer to join us and push current state
+        try:
+            requests.post(f"{peer_url}/v1/controllers/join", json={"base_url": SELF_BASE_URL, "bidirectional": False}, timeout=6)
+        except Exception:
+            pass
+        try:
+            with LOCK:
+                cur = _load_state()
+                payload = {"state": cur, "state_rev": int(cur.get("state_rev", 1) or 1)}
+            requests.post(f"{peer_url}/v1/cluster/replicate", json=payload, timeout=6)
+        except Exception:
+            pass
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return {"ok": True, "peer": f"http://{req.ip}:{req.port}", "log": "\n".join(log_lines)}
 
 
 @app.post("/v1/code/self-update")

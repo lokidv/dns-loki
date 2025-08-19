@@ -37,6 +37,41 @@ def log(msg: str):
         pass
 
 
+def parse_controller_urls(cfg: dict):
+    """Build a prioritized list of controller base URLs from config.
+    Supports:
+    - controller_urls: list[str] or comma-separated str
+    - controller_url: str (also may be comma-separated)
+    Order: items from controller_urls first, then controller_url (if not dupes).
+    """
+    items = []
+    try:
+        cu = cfg.get("controller_urls")
+        if isinstance(cu, list):
+            for x in cu:
+                s = str(x or "").strip().rstrip('/')
+                if s and s not in items:
+                    items.append(s)
+        elif isinstance(cu, str):
+            for x in cu.split(','):
+                s = x.strip().rstrip('/')
+                if s and s not in items:
+                    items.append(s)
+    except Exception:
+        pass
+    try:
+        single = cfg.get("controller_url")
+        if isinstance(single, str):
+            parts = [p.strip() for p in single.split(',')] if ("," in single) else [single.strip()]
+            for s in parts:
+                s = s.rstrip('/')
+                if s and s not in items:
+                    items.append(s)
+    except Exception:
+        pass
+    return items
+
+
 def ensure_docker_running() -> bool:
     """اطمینان از آماده بودن Docker. اگر سرویس بالا نیست، تلاش برای start/enable.
     خروجی True یعنی docker قابل استفاده است.
@@ -484,7 +519,13 @@ def main():
 
     cfg = yaml.safe_load(Path(args.config).read_text())
     role = cfg.get("role")
-    controller_url = cfg.get("controller_url")
+    # Build controller URL candidates (supports multiple URLs for HA)
+    controller_urls = parse_controller_urls(cfg)
+    if not controller_urls:
+        # Keep backward compatibility with single key or empty
+        controller_url = cfg.get("controller_url")
+        if controller_url:
+            controller_urls = [controller_url]
     git_repo = cfg.get("git_repo")
     git_branch = cfg.get("git_branch", "main")
 
@@ -504,10 +545,20 @@ def main():
     my_ip = None
 
     while True:
-        try:
-            conf = requests.get(f"{controller_url}/v1/config", timeout=5).json()
-        except Exception as e:
-            log(f"loop: failed fetching controller config -> {e}")
+        # Fetch config from the first reachable controller URL
+        conf = None
+        active_base = None
+        last_err = None
+        for base in controller_urls:
+            try:
+                conf = requests.get(f"{base}/v1/config", timeout=5).json()
+                active_base = base
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if conf is None:
+            log(f"loop: failed fetching controller config from {len(controller_urls)} urls -> {last_err}")
             time.sleep(5)
             continue
 
@@ -547,7 +598,7 @@ def main():
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
             log(f"update-check: target={agents_version_conf} applied={agents_version_applied} repo={code_repo} branch={code_branch}")
             try:
-                update_success = update_code_from_repo(code_repo, code_branch, role or "", controller_url)
+                update_success = update_code_from_repo(code_repo, code_branch, role or "", active_base)
                 log(f"update-check: update_code_from_repo returned {update_success}")
                 if update_success:
                     try:
@@ -563,8 +614,8 @@ def main():
                     # Report success to controller
                     try:
                         report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
-                        log(f"update-apply: reported success to controller")
+                        requests.post(f"{active_base}/v1/nodes/register", json=report_data, timeout=5)
+                        log(f"update-apply: reported success to controller {active_base}")
                     except Exception as e:
                         log(f"update-apply: failed reporting to controller -> {e}")
                     
@@ -584,7 +635,7 @@ def main():
             if my_ip and agents_version_applied > 0:
                 try:
                     report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                    requests.post(f"{active_base}/v1/nodes/register", json=report_data, timeout=5)
                 except Exception:
                     pass  # Silent fail for periodic reports
 
@@ -600,7 +651,7 @@ def main():
             # pull from API; refresh each loop is cheap, rendering is idempotent
             if domains_version_seen != conf.get("domains_version"):
                 domains_version_seen = conf.get("domains_version")
-            domains = fetch_domains_from_api(controller_url)
+            domains = fetch_domains_from_api(active_base)
         # Fallback seed for testing if still empty
         if not domains:
             domains = ["amd.com", "*.amd.com"]
@@ -744,7 +795,7 @@ def main():
             }
             if my_ip:
                 hb["ip"] = my_ip
-            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+            requests.post(f"{active_base}/v1/nodes", json=hb, timeout=5)
         except Exception as e:
             log(f"heartbeat: failed to post -> {e}")
 
