@@ -176,16 +176,23 @@ def _replicate_to_peers(st: dict):
     }
     headers = {"Content-Type": "application/json"}
     for url in peers:
-        try:
-            u = str(url or "").strip().rstrip("/")
-            if not u:
-                continue
-            if u == my_url:
-                continue
-            requests.post(f"{u}/v1/cluster/replicate", json=payload, headers=headers, timeout=3)
-        except Exception:
-            # best-effort; ignore failures
-            pass
+        u = str(url or "").strip().rstrip("/")
+        if not u or u == my_url:
+            continue
+        # minimal retry to cope with transient network hiccups / cold peers
+        for attempt in range(2):
+            try:
+                requests.post(f"{u}/v1/cluster/replicate", json=payload, headers=headers, timeout=6)
+                break
+            except Exception:
+                if attempt == 1:
+                    # best-effort; ignore failures after retries
+                    pass
+                else:
+                    try:
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
 
 
 def _save_and_replicate(st: dict):
@@ -916,7 +923,7 @@ def join_controller(req: JoinRequest, request: Request):
     with LOCK:
         st = _load_state()
         ctrls = [str(x).strip().rstrip("/") for x in (st.get("controllers") or []) if str(x).strip()]
-        my_url = str(SELF_BASE_URL).strip().rstrip("/")
+        my_url = str(request.base_url).rstrip('/')
         changed = False
         if my_url and my_url not in ctrls:
             ctrls.append(my_url)
@@ -930,7 +937,7 @@ def join_controller(req: JoinRequest, request: Request):
     # Bidirectional join and initial state push (best-effort)
     if req.bidirectional:
         try:
-            requests.post(f"{peer}/v1/controllers/join", json={"base_url": SELF_BASE_URL, "bidirectional": False}, timeout=4)
+            requests.post(f"{peer}/v1/controllers/join", json={"base_url": my_url, "bidirectional": False}, timeout=4)
         except Exception:
             pass
     # Push our current state to the peer for convergence
@@ -960,11 +967,13 @@ def cluster_replicate(payload: dict, request: Request = None):
         local_rev = int(local.get("state_rev", 1) or 1)
         applied = False
         if incoming_rev > local_rev:
-            # Merge controllers (union), ensure SELF_BASE_URL present
+            # Merge controllers (union), prefer externally visible URL from request
             inc_ctrls = [str(x).strip().rstrip("/") for x in (incoming_state.get("controllers") or []) if str(x).strip()]
             loc_ctrls = [str(x).strip().rstrip("/") for x in (local.get("controllers") or []) if str(x).strip()]
             merged_ctrls = []
-            for x in inc_ctrls + loc_ctrls + [SELF_BASE_URL]:
+            my_url = str(request.base_url).rstrip('/') if request is not None else None
+            extra = [my_url] if my_url else []
+            for x in inc_ctrls + loc_ctrls + extra:
                 x = str(x or "").strip().rstrip("/")
                 if x and x not in merged_ctrls:
                     merged_ctrls.append(x)
@@ -1105,7 +1114,7 @@ echo "[+] done"
                 _save_and_replicate(st)
         # Ask peer to join us and push current state
         try:
-            requests.post(f"{peer_url}/v1/controllers/join", json={"base_url": SELF_BASE_URL, "bidirectional": False}, timeout=6)
+            requests.post(f"{peer_url}/v1/controllers/join", json={"base_url": base_url, "bidirectional": False}, timeout=6)
         except Exception:
             pass
         try:
