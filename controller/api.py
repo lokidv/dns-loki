@@ -1047,7 +1047,7 @@ sudo /opt/dns-proxy/controller/venv/bin/pip install --upgrade pip
 if [ -f /opt/dns-proxy/controller/requirements.txt ]; then sudo /opt/dns-proxy/controller/venv/bin/pip install -r /opt/dns-proxy/controller/requirements.txt; fi
 
 echo "[+] writing systemd service"
-cat <<EOF | sudo tee /etc/systemd/system/dns-loki-controller.service >/dev/null
+cat <<EOF | sudo tee /etc/systemd/system/dns-proxy-controller.service >/dev/null
 [Unit]
 Description=DNS Loki Controller
 After=network-online.target
@@ -1059,7 +1059,7 @@ Environment=DATA_DIR=/opt/dns-proxy/data
 Environment=HOST=$HOST_IP
 Environment=PORT=$PORT
 WorkingDirectory=/opt/dns-proxy/controller
-ExecStart=/opt/dns-proxy/controller/venv/bin/uvicorn controller.api:app --host 0.0.0.0 --port $PORT
+ExecStart=/opt/dns-proxy/controller/venv/bin/uvicorn api:app --host 0.0.0.0 --port $PORT
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -1069,7 +1069,7 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now dns-loki-controller.service
+sudo systemctl enable --now dns-proxy-controller.service
 
 echo "[+] done"
 """
