@@ -186,6 +186,46 @@
 
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
+      <h2>کنترلرها</h2>
+      <div class="muted">افزودن کنترلر جدید (Promote) یا اتصال یک کنترلر موجود (Join). پس از اضافه شدن، State به‌صورت خودکار همگام‌سازی می‌شود.</div>
+      <div style="margin-top:10px;">
+        <h3 style="font-size:16px; margin:8px 0;">افزودن کنترلر همتا (Join)</h3>
+        <div class="input-inline" style="gap:8px; flex-wrap:wrap;">
+          <input id="joinUrl" placeholder="http://peer-controller:8080" style="min-width:320px; direction:ltr;" />
+          <label><input type="checkbox" id="joinBi" checked /> دوطرفه (bidirectional)</label>
+          <button id="btnJoinCtrl">افزودن کنترلر</button>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div>
+        <h3 style="font-size:16px; margin:8px 0;">پروموت کنترلر جدید (SSH)</h3>
+        <div class="grid-2" style="margin-top:8px;">
+          <div class="input-inline" style="gap:8px; flex-wrap:wrap;">
+            <input id="pcIp" placeholder="IP" style="min-width:160px;" />
+            <input id="pcPort" placeholder="Port" value="8080" style="width:120px;" />
+            <input id="pcUser" placeholder="SSH Username" style="min-width:160px;" />
+            <input id="pcPass" placeholder="SSH Password (اختیاری)" type="password" style="min-width:200px;" />
+            <textarea id="pcKey" placeholder="SSH Private Key (اختیاری)" rows="3" style="min-width:320px; width:100%;"></textarea>
+          </div>
+          <div class="input-inline" style="justify-content:flex-end; gap:8px;">
+            <button id="btnPromoteCtrl" class="btn-primary">Promote Controller</button>
+          </div>
+        </div>
+        <details style="margin-top:10px;">
+          <summary>لاگ عملیات</summary>
+          <pre id="ctrlLog" style="white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--border); padding:10px; border-radius:10px; max-height:260px; overflow:auto;"></pre>
+        </details>
+      </div>
+      <div class="divider"></div>
+      <div>
+        <h3 style="font-size:16px; margin:8px 0;">کنترلرهای شناخته‌شده</h3>
+        <ul id="controllersList" style="margin:0; padding-inline-start:20px;"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-12">
       <h2>پروویژن پروکسی (SSH)</h2>
       <div class="muted">با وارد کردن اطلاعات اتصال، سرور به عنوان پروکسی تنظیم و Agent نصب می‌شود.</div>
       <div class="grid-2" style="margin-top:8px;">
@@ -241,6 +281,22 @@ async function loadConfig(){
   const fp = document.getElementById('flagProxy');
   if(fd) fd.checked = !!j.enforce_dns_clients;
   if(fp) fp.checked = !!j.enforce_proxy_clients;
+  // render controllers list
+  const cl = document.getElementById('controllersList');
+  if(cl){
+    cl.innerHTML = '';
+    const arr = Array.isArray(j.controllers) ? j.controllers : [];
+    arr.forEach(u => {
+      const li = document.createElement('li');
+      li.innerHTML = `<code>${u}</code>`;
+      cl.appendChild(li);
+    });
+    if(arr.length===0){
+      const li = document.createElement('li');
+      li.textContent = '—';
+      cl.appendChild(li);
+    }
+  }
 }
 
 function renderDomains(){
@@ -462,17 +518,14 @@ async function loadNodes(){
       const user = (trd.querySelector('.rsUser').value || '').trim();
       const pass = trd.querySelector('.rsPass').value;
       const key = trd.querySelector('.rsKey').value;
-      const sAgent = trd.querySelector('.rsAgent').checked;
-      const sCore = trd.querySelector('.rsCoreDNS').checked;
-      const sSni = trd.querySelector('.rsSNI').checked;
       const logEl = trd.querySelector('.rsLog');
       logEl.textContent = '';
       if(!user){ alert('Username الزامی است'); return; }
       if(!pass && !key){ alert('لطفاً یکی از password یا key را وارد کنید'); return; }
       const services = [];
-      if(sAgent) services.push('agent');
-      if(sCore) services.push('coredns');
-      if(sSni) services.push('sniproxy');
+      if(trd.querySelector('.rsAgent').checked) services.push('agent');
+      if(trd.querySelector('.rsCoreDNS').checked) services.push('coredns');
+      if(trd.querySelector('.rsSNI').checked) services.push('sniproxy');
       if(services.length===0){ alert('حداقل یک سرویس را انتخاب کنید'); return; }
       const body = { ssh_user: user, services };
       if(pass) body.ssh_password = pass;
@@ -636,9 +689,9 @@ document.getElementById('btnNodesUpdate').onclick = async ()=>{
 document.getElementById('btnSetAgentsVersion').onclick = async ()=>{
   const val = (document.getElementById('agentsTarget').value || '').trim();
   if(!val){ alert('لطفاً نسخه هدف را وارد کنید.'); return; }
-  const num = parseInt(val, 10);
-  if(isNaN(num) || num < 0){ alert('نسخه نامعتبر است.'); return; }
-  const r = await api('/v1/nodes/version', { method:'POST', body: JSON.stringify({ agents_version: num })});
+  const target = parseInt(val, 10);
+  if(isNaN(target) || target < 0){ alert('نسخه نامعتبر است.'); return; }
+  const r = await api('/v1/nodes/version', { method:'POST', body: JSON.stringify({ agents_version: target })});
   if(!r.ok){ const t = await r.text(); alert('خطا در تنظیم نسخه: ' + t); return; }
   await loadConfig();
   await loadNodes();
