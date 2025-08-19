@@ -698,6 +698,60 @@ document.getElementById('btnSetAgentsVersion').onclick = async ()=>{
   alert('نسخه هدف تنظیم شد.');
 };
 
+// controllers: join peer
+document.getElementById('btnJoinCtrl')?.addEventListener('click', async () => {
+  const url = (document.getElementById('joinUrl')?.value || '').trim();
+  const bi = !!document.getElementById('joinBi')?.checked;
+  if(!url){ alert('لطفاً آدرس کنترلر همتا را وارد کنید.'); return; }
+  try{
+    const r = await api('/v1/controllers/join', { method:'POST', body: JSON.stringify({ base_url: url, bidirectional: bi })});
+    if(!r.ok){ const t = await r.text(); alert('خطا در افزودن کنترلر: ' + t); return; }
+    const j = await r.json().catch(()=>({}));
+    document.getElementById('joinUrl').value = '';
+    await loadConfig();
+    alert('کنترلر افزوده شد.');
+  }catch(e){
+    alert('خطا در افزودن کنترلر: ' + (e?.message || e));
+  }
+});
+
+// controllers: promote new controller via SSH
+document.getElementById('btnPromoteCtrl')?.addEventListener('click', async () => {
+  const ip = (document.getElementById('pcIp')?.value || '').trim();
+  const portStr = (document.getElementById('pcPort')?.value || '').trim();
+  const port = parseInt(portStr, 10);
+  const user = (document.getElementById('pcUser')?.value || '').trim();
+  const pass = document.getElementById('pcPass')?.value;
+  const key = document.getElementById('pcKey')?.value;
+  const logEl = document.getElementById('ctrlLog');
+  if(logEl) logEl.textContent = '';
+  if(!ip || !user){ alert('IP و Username الزامی هستند'); return; }
+  if(!pass && !key){ alert('لطفاً یکی از password یا key را وارد کنید'); return; }
+  const body = { ip, ssh_user: user };
+  if(!isNaN(port) && port > 0) body.port = port;
+  if(pass) body.ssh_password = pass;
+  if(key) body.ssh_key = key;
+  const btn = document.getElementById('btnPromoteCtrl');
+  if(btn){ btn.disabled = true; btn.textContent = 'در حال Promote...'; }
+  try{
+    const r = await api('/v1/controllers/promote', { method:'POST', body: JSON.stringify(body) });
+    const txt = await r.text();
+    if(!r.ok){
+      if(logEl) logEl.textContent = txt || 'خطای نامشخص';
+      alert('Promote ناموفق بود');
+      return;
+    }
+    let j = {};
+    try{ j = JSON.parse(txt); }catch(_){ }
+    if(logEl) logEl.textContent = j.log || txt || 'OK';
+    await loadConfig();
+  }catch(e){
+    if(logEl) logEl.textContent = (e?.message || e);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = 'Promote Controller'; }
+  }
+});
+
 // proxy provision
 document.getElementById('btnProvision').onclick = async ()=>{
   const ip = document.getElementById('pxIp').value.trim();
