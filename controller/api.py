@@ -73,6 +73,7 @@ class ConfigOut(BaseModel):
     code_branch: str
     enforce_dns_clients: bool = True
     enforce_proxy_clients: bool = False
+    controllers: List[str] = []
 
 class DomainsPayload(BaseModel):
     domains: List[str]
