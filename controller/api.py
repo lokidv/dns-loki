@@ -12,7 +12,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 import io
 import paramiko
 
@@ -50,6 +50,18 @@ def require_internal(request: Request):
         token = _extract_bearer_token(request.headers.get("Authorization"))
     if token != expected:
         raise HTTPException(status_code=403, detail="forbidden")
+
+# Global safeguard: enforce internal token on mutating requests by default
+@app.middleware("http")
+async def enforce_internal_token_mw(request: Request, call_next):
+    expected = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    method = request.method.upper()
+    if expected and method in {"POST", "PUT", "PATCH", "DELETE"}:
+        try:
+            require_internal(request)
+        except HTTPException as e:
+            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    return await call_next(request)
 
 @app.get("/")
 def root():
