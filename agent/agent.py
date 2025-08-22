@@ -37,6 +37,19 @@ def log(msg: str):
         pass
 
 
+def _auth_headers(token: str):
+    """Build authentication headers for controller calls using INTERNAL_TOKEN.
+    Returns None if token empty to avoid sending extra headers.
+    """
+    tok = (token or "").strip()
+    if not tok:
+        return None
+    return {
+        "X-Internal-Token": tok,
+        "Authorization": f"Bearer {tok}",
+    }
+
+
 def ensure_docker_running() -> bool:
     """اطمینان از آماده بودن Docker. اگر سرویس بالا نیست، تلاش برای start/enable.
     خروجی True یعنی docker قابل استفاده است.
@@ -92,7 +105,7 @@ def _github_zip_url(repo_url: str, branch: str):
     return f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
 
 
-def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url: str = None):
+def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url: str = None, headers=None):
     url = _github_zip_url(repo_url, branch)
     if not url:
         log(f"update: invalid repo url -> repo={repo_url!r} branch={branch!r}")
@@ -110,7 +123,13 @@ def update_code_from_repo(repo_url: str, branch: str, role: str, controller_url:
             if controller_url:
                 try:
                     log(f"update: GitHub direct failed; trying controller proxy {controller_url}/v1/code/archive")
-                    r = requests.get(f"{controller_url}/v1/code/archive", params={"repo": repo_url, "branch": branch}, timeout=45, stream=True)
+                    r = requests.get(
+                        f"{controller_url}/v1/code/archive",
+                        params={"repo": repo_url, "branch": branch},
+                        timeout=45,
+                        stream=True,
+                        headers=headers,
+                    )
                     r.raise_for_status()
                     with open(zip_path, "wb") as f:
                         for chunk in r.iter_content(chunk_size=65536):
@@ -188,9 +207,9 @@ def read_domains_list():
     return domains
 
 
-def fetch_domains_from_api(controller_url: str):
+def fetch_domains_from_api(controller_url: str, headers=None):
     try:
-        r = requests.get(f"{controller_url}/v1/domains", timeout=5)
+        r = requests.get(f"{controller_url}/v1/domains", timeout=5, headers=headers)
         if r.status_code == 200:
             items = r.json()
             if isinstance(items, list):
@@ -487,6 +506,9 @@ def main():
     controller_url = cfg.get("controller_url")
     git_repo = cfg.get("git_repo")
     git_branch = cfg.get("git_branch", "main")
+    # INTERNAL_TOKEN can be provided via env or config for authenticating to controller
+    internal_token = (os.environ.get("INTERNAL_TOKEN") or str(cfg.get("internal_token") or "")).strip()
+    headers = _auth_headers(internal_token)
 
     domains_version_seen = None
     # track applied agents_version on disk to avoid loops across restarts
@@ -505,7 +527,7 @@ def main():
 
     while True:
         try:
-            conf = requests.get(f"{controller_url}/v1/config", timeout=5).json()
+            conf = requests.get(f"{controller_url}/v1/config", timeout=5, headers=headers).json()
         except Exception as e:
             log(f"loop: failed fetching controller config -> {e}")
             time.sleep(5)
@@ -547,7 +569,7 @@ def main():
         if agents_version_applied is None or agents_version_applied != agents_version_conf:
             log(f"update-check: target={agents_version_conf} applied={agents_version_applied} repo={code_repo} branch={code_branch}")
             try:
-                update_success = update_code_from_repo(code_repo, code_branch, role or "", controller_url)
+                update_success = update_code_from_repo(code_repo, code_branch, role or "", controller_url, headers=headers)
                 log(f"update-check: update_code_from_repo returned {update_success}")
                 if update_success:
                     try:
@@ -563,7 +585,7 @@ def main():
                     # Report success to controller
                     try:
                         report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5, headers=headers)
                         log(f"update-apply: reported success to controller")
                     except Exception as e:
                         log(f"update-apply: failed reporting to controller -> {e}")
@@ -584,7 +606,7 @@ def main():
             if my_ip and agents_version_applied > 0:
                 try:
                     report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5, headers=headers)
                 except Exception:
                     pass  # Silent fail for periodic reports
 
@@ -600,7 +622,7 @@ def main():
             # pull from API; refresh each loop is cheap, rendering is idempotent
             if domains_version_seen != conf.get("domains_version"):
                 domains_version_seen = conf.get("domains_version")
-            domains = fetch_domains_from_api(controller_url)
+            domains = fetch_domains_from_api(controller_url, headers=headers)
         # Fallback seed for testing if still empty
         if not domains:
             domains = ["amd.com", "*.amd.com"]
