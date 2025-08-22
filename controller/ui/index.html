@@ -126,6 +126,16 @@
         </div>
       </details>
       <details style="margin-top:10px;">
+        <summary>توکن داخلی (Site ↔ Controller)</summary>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input id="internalTokenInput" placeholder="توکن داخلی" style="min-width:260px" />
+          <button id="btnSaveToken">ذخیره توکن</button>
+          <button id="btnClearToken" style="background-color:#444;">حذف از مرورگر</button>
+          <span id="tokenStatus" class="muted"></span>
+        </div>
+        <div class="muted">این توکن روی مرورگر شما ذخیره می‌شود و همراه درخواست‌ها ارسال می‌گردد. برای فعال‌سازی سمت سرور، متغیر محیطی INTERNAL_TOKEN را تنظیم کنید.</div>
+      </details>
+      <details style="margin-top:10px;">
         <summary>اعمال محدودیت دسترسی (enforce)</summary>
         <div style="margin-top:8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
           <label><input type="checkbox" id="flagDns" /> Enforce DNS</label>
@@ -208,7 +218,22 @@
   </div>
 
 <script>
-const api = (path, opts={}) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+function getInternalToken(){
+  try { return localStorage.getItem('INTERNAL_TOKEN') || ''; } catch(e){ return ''; }
+}
+const api = (path, opts={}) => {
+  const token = getInternalToken();
+  const baseHeaders = { 'Content-Type': 'application/json' };
+  if (token) {
+    baseHeaders['X-Internal-Token'] = token;
+    baseHeaders['Authorization'] = 'Bearer ' + token;
+  }
+  const merged = Object.assign({ headers: baseHeaders }, opts || {});
+  if (opts && opts.headers) {
+    merged.headers = Object.assign({}, baseHeaders, opts.headers);
+  }
+  return fetch(path, merged);
+};
 let APP = { cfg: null, refreshTimer: null, domainsAll: [] };
 
 async function loadConfig(){
@@ -241,6 +266,15 @@ async function loadConfig(){
   const fp = document.getElementById('flagProxy');
   if(fd) fd.checked = !!j.enforce_dns_clients;
   if(fp) fp.checked = !!j.enforce_proxy_clients;
+}
+
+function updateTokenUI(){
+  const el = document.getElementById('tokenStatus');
+  if(!el) return;
+  const t = getInternalToken();
+  el.textContent = t ? 'توکن تنظیم شده است.' : 'توکن تنظیم نشده است.';
+  const inp = document.getElementById('internalTokenInput');
+  if (inp && t) inp.value = t;
 }
 
 function renderDomains(){
@@ -502,6 +536,7 @@ async function loadNodes(){
 
 async function init(){
   await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+  updateTokenUI();
 }
 
 init();
@@ -536,6 +571,20 @@ document.getElementById('btnSaveFlags')?.addEventListener('click', async () => {
   if(!r.ok){ const t = await r.text(); alert('خطا در ذخیره enforce: ' + t); return; }
   await loadConfig();
   alert('ذخیره شد.');
+});
+
+// internal token handlers
+document.getElementById('btnSaveToken')?.addEventListener('click', () => {
+  const v = (document.getElementById('internalTokenInput')?.value || '').trim();
+  if(!v){ alert('توکن را وارد کنید'); return; }
+  try { localStorage.setItem('INTERNAL_TOKEN', v); } catch(e){}
+  updateTokenUI();
+  alert('توکن ذخیره شد.');
+});
+document.getElementById('btnClearToken')?.addEventListener('click', () => {
+  try { localStorage.removeItem('INTERNAL_TOKEN'); } catch(e){}
+  updateTokenUI();
+  alert('توکن پاک شد.');
 });
 
 // helpers
