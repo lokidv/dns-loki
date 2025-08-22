@@ -9,12 +9,15 @@ import subprocess
 import time
 from urllib.request import urlopen
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, Form
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse, HTMLResponse, PlainTextResponse
 import io
 import paramiko
+import hashlib
+import hmac
+import secrets
 
 DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
@@ -24,10 +27,10 @@ LOCK = threading.Lock()
 
 app = FastAPI(title="DNS+SNI Control Plane")
 
-# Serve simple UI if available
+# Serve UI via an internal mount; external path is configurable via state
 UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
 if os.path.isdir(UI_DIR):
-    app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
+    app.mount("/_ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
 
 # ===== Internal Auth (Site ↔ Controller) =====
 # If env INTERNAL_TOKEN is set, mutating endpoints must include a valid token via
@@ -35,13 +38,28 @@ if os.path.isdir(UI_DIR):
 def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
     if not auth_header:
         return None
-    m = re.match(r"Bearer\s+(.+)", auth_header, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
+    m = re.match(r"^Bearer\s+(.+)$", auth_header.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+def _get_effective_internal_token() -> (str, str):
+    """Return (token, source) where source is one of: 'env', 'state', 'none'."""
+    env_tok = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    if env_tok:
+        return env_tok, "env"
+    try:
+        with LOCK:
+            st = _load_state()
+            tok = (st.get("internal_token") or "").strip()
+            if tok:
+                return tok, "state"
+    except Exception:
+        pass
+    return "", "none"
 
 def require_internal(request: Request):
-    expected = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    expected, _src = _get_effective_internal_token()
     # When not configured, treat as open (no auth enforced)
     if not expected:
         return
@@ -51,12 +69,128 @@ def require_internal(request: Request):
     if token != expected:
         raise HTTPException(status_code=403, detail="forbidden")
 
-# Global safeguard: enforce internal token on mutating requests by default
+# ===== UI security helpers =====
+def _ensure_state_defaults(st: dict) -> dict:
+    # Ensure new defaults exist
+    st.setdefault("ui_path", "ui")
+    st.setdefault("ui_auth_enabled", False)
+    st.setdefault("ui_username", None)
+    st.setdefault("ui_password", None)  # pbkdf2 encoded
+    st.setdefault("ui_session_secret", None)
+    st.setdefault("enforce_token_on_reads", False)
+    st.setdefault("internal_token", None)
+    if not st.get("ui_session_secret"):
+        st["ui_session_secret"] = secrets.token_hex(16)
+    return st
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    iterations = 200_000
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algo, iters_s, salt_hex, dk_hex = encoded.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iters_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(dk_hex)
+        got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(got, expected)
+    except Exception:
+        return False
+
+def _make_ui_session(username: str, secret: str, ttl_seconds: int = 3600 * 12) -> str:
+    exp = int(time.time()) + ttl_seconds
+    data = f"{username}:{exp}"
+    sig = hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{username}:{exp}:{sig}"
+
+def _check_ui_session(cookie_val: str, secret: str, expected_user: Optional[str]) -> bool:
+    try:
+        username, exp_s, sig = cookie_val.split(":", 2)
+        exp = int(exp_s)
+        if expected_user and username != expected_user:
+            return False
+        if exp < int(time.time()):
+            return False
+        data = f"{username}:{exp}"
+        want = hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(want, sig)
+    except Exception:
+        return False
+
+# Dynamic UI path router: map /{ui_path} -> /_ui
+@app.middleware("http")
+async def ui_path_router(request: Request, call_next):
+    path = request.scope.get("path", "")
+    # Allow root to fall through; handled by root() redirect
+    if not path:
+        return await call_next(request)
+    try:
+        with LOCK:
+            st = _load_state()
+            st = _ensure_state_defaults(st)
+            ui_path = (st.get("ui_path") or "ui").strip("/")
+    except Exception:
+        ui_path = "ui"
+
+    # If request targets configured UI path, rewrite to internal mount
+    if path == f"/{ui_path}" or path.startswith(f"/{ui_path}/"):
+        new_path = "/_ui" + path[len(f"/{ui_path}"):]
+        request.scope["path"] = new_path if new_path else "/_ui/"
+        return await call_next(request)
+
+    # If someone tries default /ui but ui_path is different, 404 to hide it
+    if path == "/ui" or path.startswith("/ui/"):
+        if ui_path != "ui":
+            return PlainTextResponse("Not Found", status_code=404)
+        # If ui_path is still 'ui', rewrite to internal
+        new_path = "/_ui" + path[len("/ui"):]
+        request.scope["path"] = new_path if new_path else "/_ui/"
+        return await call_next(request)
+
+    return await call_next(request)
+
+# UI auth gate: protect UI when enabled
+@app.middleware("http")
+async def ui_auth_gate(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path.startswith("/_ui"):
+        with LOCK:
+            st = _load_state()
+            st = _ensure_state_defaults(st)
+            auth_on = bool(st.get("ui_auth_enabled", False))
+            secret = st.get("ui_session_secret") or ""
+            expected_user = st.get("ui_username")
+        if auth_on:
+            cookie_val = request.cookies.get("ui_session")
+            if not cookie_val or not _check_ui_session(cookie_val, secret, expected_user):
+                # If HTML is acceptable, redirect to login, else 401
+                accept = request.headers.get("accept", "")
+                if "text/html" in accept or "*/*" in accept:
+                    return RedirectResponse(url="/_ui/login")
+                return JSONResponse(status_code=401, content={"detail": "auth required"})
+    return await call_next(request)
+
+# Global safeguard: enforce internal token on mutating requests by default; optionally on GET too
 @app.middleware("http")
 async def enforce_internal_token_mw(request: Request, call_next):
-    expected = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    expected, _src = _get_effective_internal_token()
     method = request.method.upper()
-    if expected and method in {"POST", "PUT", "PATCH", "DELETE"}:
+    path = request.scope.get("path", "")
+    protect_reads = False
+    try:
+        with LOCK:
+            st = _load_state()
+            st = _ensure_state_defaults(st)
+            protect_reads = bool(st.get("enforce_token_on_reads", False))
+    except Exception:
+        protect_reads = False
+    should_enforce = method in {"POST", "PUT", "PATCH", "DELETE"} or (method in {"GET", "HEAD"} and protect_reads and not path.startswith("/_ui"))
+    if expected and should_enforce:
         try:
             require_internal(request)
         except HTTPException as e:
@@ -66,7 +200,11 @@ async def enforce_internal_token_mw(request: Request, call_next):
 @app.get("/")
 def root():
     if os.path.isdir(UI_DIR):
-        return RedirectResponse(url="/ui/")
+        with LOCK:
+            st = _load_state()
+            st = _ensure_state_defaults(st)
+            ui_path = (st.get("ui_path") or "ui").strip("/")
+        return RedirectResponse(url=f"/{ui_path}/")
     return {"ok": True}
 
 class Client(BaseModel):
@@ -101,7 +239,11 @@ class ConfigOut(BaseModel):
     code_branch: str
     enforce_dns_clients: bool = True
     enforce_proxy_clients: bool = False
+    enforce_token_on_reads: bool = False
+    ui_path: str = "ui"
+    ui_auth_enabled: bool = False
     internal_auth_enabled: bool = False
+    internal_auth_source: Optional[str] = "none"
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -113,6 +255,7 @@ class DomainItem(BaseModel):
 class FlagsPayload(BaseModel):
     enforce_dns_clients: Optional[bool] = None
     enforce_proxy_clients: Optional[bool] = None
+    enforce_token_on_reads: Optional[bool] = None
 
 
 class ProvisionRequest(BaseModel):
@@ -183,7 +326,9 @@ def get_config():
         st = _load_state()
         # Reflect whether INTERNAL_TOKEN is set in the running process
         st = dict(st)
-        st["internal_auth_enabled"] = bool((os.environ.get("INTERNAL_TOKEN") or "").strip())
+        tok, src = _get_effective_internal_token()
+        st["internal_auth_enabled"] = bool(tok)
+        st["internal_auth_source"] = src
         return st
 
 
@@ -223,6 +368,7 @@ def get_flags():
         return {
             "enforce_dns_clients": bool(st.get("enforce_dns_clients", True)),
             "enforce_proxy_clients": bool(st.get("enforce_proxy_clients", False)),
+            "enforce_token_on_reads": bool(st.get("enforce_token_on_reads", False)),
         }
 
 
@@ -234,11 +380,153 @@ def set_flags(f: FlagsPayload):
             st["enforce_dns_clients"] = bool(f.enforce_dns_clients)
         if f.enforce_proxy_clients is not None:
             st["enforce_proxy_clients"] = bool(f.enforce_proxy_clients)
+        if f.enforce_token_on_reads is not None:
+            st["enforce_token_on_reads"] = bool(f.enforce_token_on_reads)
         _save_state(st)
         return {
             "enforce_dns_clients": st.get("enforce_dns_clients", True),
             "enforce_proxy_clients": st.get("enforce_proxy_clients", False),
+            "enforce_token_on_reads": st.get("enforce_token_on_reads", False),
         }
+
+# ===== Internal token management =====
+class InternalTokenPayload(BaseModel):
+    token: Optional[str] = None
+
+@app.get("/v1/internal-token")
+def internal_token_status():
+    tok, src = _get_effective_internal_token()
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        state_tok = (st.get("internal_token") or "").strip()
+    return {
+        "enabled": bool(tok),
+        "source": src,
+        "has_state_token": bool(state_tok),
+        "can_set": not bool((os.environ.get("INTERNAL_TOKEN") or "").strip()),
+    }
+
+@app.post("/v1/internal-token")
+def set_internal_token(p: InternalTokenPayload):
+    env_tok = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    if env_tok:
+        # Environment token takes precedence and is immutable via API/UI
+        raise HTTPException(status_code=400, detail="env token set; cannot change via API")
+    val = (p.token or "").strip() if p and (p.token is not None) else ""
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        st["internal_token"] = val if val else None
+        _save_state(st)
+    tok, src = _get_effective_internal_token()
+    return {
+        "ok": True,
+        "enabled": bool(tok),
+        "source": "state" if val else "none",
+        "has_state_token": bool(val),
+    }
+
+# ===== UI settings management =====
+class UISettingsPayload(BaseModel):
+    ui_path: Optional[str] = None
+    ui_auth_enabled: Optional[bool] = None
+    ui_username: Optional[str] = None
+    ui_password: Optional[str] = None
+
+def _sanitize_ui_path(value: str) -> str:
+    # allow letters, digits, dash, underscore; strip slashes
+    val = (value or "ui").strip().strip("/")
+    if not val:
+        return "ui"
+    if not re.match(r"^[A-Za-z0-9_-]{2,64}$", val):
+        raise HTTPException(status_code=400, detail="invalid ui_path")
+    return val
+
+@app.get("/v1/ui/settings", dependencies=[Depends(require_internal)])
+def get_ui_settings():
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        return {
+            "ui_path": (st.get("ui_path") or "ui"),
+            "ui_auth_enabled": bool(st.get("ui_auth_enabled", False)),
+            "ui_username": st.get("ui_username"),
+            "ui_password_set": bool(st.get("ui_password")),
+        }
+
+@app.post("/v1/ui/settings", dependencies=[Depends(require_internal)])
+def set_ui_settings(payload: UISettingsPayload):
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        if payload.ui_path is not None:
+            st["ui_path"] = _sanitize_ui_path(payload.ui_path)
+        if payload.ui_auth_enabled is not None:
+            st["ui_auth_enabled"] = bool(payload.ui_auth_enabled)
+        if payload.ui_username is not None:
+            st["ui_username"] = payload.ui_username.strip() or None
+        if payload.ui_password is not None:
+            if payload.ui_password.strip():
+                st["ui_password"] = _hash_password(payload.ui_password)
+            else:
+                st["ui_password"] = None
+        _save_state(st)
+        return {
+            "ui_path": st.get("ui_path"),
+            "ui_auth_enabled": st.get("ui_auth_enabled"),
+            "ui_username": st.get("ui_username"),
+            "ui_password_set": bool(st.get("ui_password")),
+        }
+
+# ===== UI login/logout endpoints =====
+@app.get("/_ui/login")
+def ui_login_page():
+    html = """
+    <!doctype html>
+    <html><head><meta charset=\"utf-8\"><title>Login</title>
+    <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#0b1220;color:#eaeef6}form{background:#111a2c;padding:24px;border-radius:8px;min-width:320px}input{width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #2a3450;background:#0e1726;color:#eaeef6}button{width:100%;padding:10px;background:#3b82f6;border:none;border-radius:6px;color:white;cursor:pointer}h2{text-align:center}</style>
+    </head><body>
+    <form method=\"post\" action=\"/\_ui/login\"> 
+      <h2>Controller Login</h2>
+      <label>Username</label>
+      <input name=\"username\" required>
+      <label>Password</label>
+      <input name=\"password\" type=\"password\" required>
+      <button type=\"submit\">Sign in</button>
+    </form>
+    </body></html>
+    """
+    return HTMLResponse(content=html)
+
+@app.post("/_ui/login")
+def ui_login(username: str = Form(...), password: str = Form(...)):
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        if not bool(st.get("ui_auth_enabled", False)):
+            # If auth disabled, just redirect to UI
+            ui_path = (st.get("ui_path") or "ui").strip("/")
+            return RedirectResponse(url=f"/{ui_path}/", status_code=302)
+        stored_user = st.get("ui_username")
+        stored_pw = st.get("ui_password")
+        if not stored_user or not stored_pw or username != stored_user or not _verify_password(password, stored_pw):
+            return HTMLResponse("<h3 style='color:red'>Invalid credentials</h3>", status_code=401)
+        cookie_val = _make_ui_session(username, st.get("ui_session_secret") or "")
+        ui_path = (st.get("ui_path") or "ui").strip("/")
+        resp = RedirectResponse(url=f"/{ui_path}/", status_code=302)
+        resp.set_cookie("ui_session", cookie_val, httponly=True, samesite="lax", max_age=12*3600)
+        return resp
+
+@app.get("/_ui/logout")
+def ui_logout():
+    with LOCK:
+        st = _load_state()
+        st = _ensure_state_defaults(st)
+        ui_path = (st.get("ui_path") or "ui").strip("/")
+    resp = RedirectResponse(url=f"/{ui_path}/", status_code=302)
+    resp.delete_cookie("ui_session")
+    return resp
 
 
 @app.get("/v1/nodes", response_model=List[Node])

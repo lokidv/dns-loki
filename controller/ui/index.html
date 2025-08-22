@@ -129,11 +129,21 @@
         <summary>توکن داخلی (Site ↔ Controller)</summary>
         <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input id="internalTokenInput" placeholder="توکن داخلی" style="min-width:260px" />
-          <button id="btnSaveToken">ذخیره توکن</button>
+          <button id="btnSaveToken">ذخیره در مرورگر</button>
           <button id="btnClearToken" style="background-color:#444;">حذف از مرورگر</button>
           <span id="tokenStatus" class="muted"></span>
         </div>
-        <div class="muted">این توکن روی مرورگر شما ذخیره می‌شود و همراه درخواست‌ها ارسال می‌گردد. برای فعال‌سازی سمت سرور، متغیر محیطی INTERNAL_TOKEN را تنظیم کنید.</div>
+        <div class="divider"></div>
+        <div class="kv">
+          <b>وضعیت توکن کنترلر</b><div id="serverTokenEnabled">—</div>
+          <b>منبع</b><div id="serverTokenSource">—</div>
+        </div>
+        <div class="input-inline" style="margin-top:8px; gap:8px; flex-wrap:wrap;">
+          <button id="btnSetServerToken" class="btn-primary">ثبت توکن روی کنترلر</button>
+          <button id="btnClearServerToken" style="background-color:#e74c3c; color:white;">حذف توکن از کنترلر</button>
+          <span id="serverTokenNote" class="muted"></span>
+        </div>
+        <div class="muted" style="margin-top:6px;">در صورتی که متغیر محیطی INTERNAL_TOKEN تنظیم شده باشد، امکان تغییر توکن از طریق UI وجود ندارد.</div>
       </details>
       <details style="margin-top:10px;">
         <summary>اعمال محدودیت دسترسی (enforce)</summary>
@@ -275,6 +285,25 @@ function updateTokenUI(){
   el.textContent = t ? 'توکن تنظیم شده است.' : 'توکن تنظیم نشده است.';
   const inp = document.getElementById('internalTokenInput');
   if (inp && t) inp.value = t;
+}
+
+async function loadServerTokenStatus(){
+  try{
+    const r = await api('/v1/internal-token');
+    const j = await r.json();
+    const en = document.getElementById('serverTokenEnabled');
+    const src = document.getElementById('serverTokenSource');
+    const note = document.getElementById('serverTokenNote');
+    const bSet = document.getElementById('btnSetServerToken');
+    const bClr = document.getElementById('btnClearServerToken');
+    if(en) en.textContent = j.enabled ? 'فعال' : 'غیرفعال';
+    if(src) src.textContent = j.source || 'none';
+    if(note) note.textContent = (j.source === 'env') ? 'توکن از محیط بارگذاری شده و قابل تغییر نیست.' : '';
+    if(bSet) bSet.disabled = (j.source === 'env');
+    if(bClr) bClr.disabled = (j.source === 'env') || !j.has_state_token;
+  }catch(e){
+    // ignore
+  }
 }
 
 function renderDomains(){
@@ -537,6 +566,7 @@ async function loadNodes(){
 async function init(){
   await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
   updateTokenUI();
+  await loadServerTokenStatus();
 }
 
 init();
@@ -587,6 +617,34 @@ document.getElementById('btnClearToken')?.addEventListener('click', () => {
   alert('توکن پاک شد.');
 });
 
+// server-side internal token actions
+document.getElementById('btnSetServerToken')?.addEventListener('click', async () => {
+  const v = (document.getElementById('internalTokenInput')?.value || '').trim();
+  if(!v){ alert('توکن را وارد کنید'); return; }
+  try{
+    const r = await api('/v1/internal-token', { method:'POST', body: JSON.stringify({ token: v }) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در ثبت توکن روی کنترلر: ' + t); return; }
+    await loadServerTokenStatus();
+    alert('توکن روی کنترلر ثبت شد.');
+  }catch(e){
+    alert('خطا: ' + (e?.message || e));
+  }
+});
+
+document.getElementById('btnClearServerToken')?.addEventListener('click', async () => {
+  if(!confirm('توکن ذخیره‌شده در کنترلر پاک شود؟')) return;
+  try{
+    const r = await api('/v1/internal-token', { method:'POST', body: JSON.stringify({ token: '' }) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در حذف توکن کنترلر: ' + t); return; }
+    await loadServerTokenStatus();
+    alert('توکن کنترلر حذف شد.');
+  }catch(e){
+    alert('خطا: ' + (e?.message || e));
+  }
+});
+
 // helpers
 function fmtAgo(ts){
   const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
@@ -624,6 +682,7 @@ syncBtn.onclick = async ()=>{
 // manual refresh
 document.getElementById('btnRefresh').onclick = async ()=>{
   await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+  await loadServerTokenStatus();
 };
 
 // auto refresh toggle
@@ -632,6 +691,7 @@ document.getElementById('autoRefresh').addEventListener('change', (e)=>{
     if(APP.refreshTimer) clearInterval(APP.refreshTimer);
     APP.refreshTimer = setInterval(async ()=>{
       await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+      await loadServerTokenStatus();
     }, 10000);
   } else {
     if(APP.refreshTimer) clearInterval(APP.refreshTimer);
