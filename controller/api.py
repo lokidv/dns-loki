@@ -614,6 +614,15 @@ def disable_node(ip: str):
         return st["nodes"]
 
 
+@app.delete("/v1/nodes/{ip}", response_model=List[Node], dependencies=[Depends(require_internal)])
+def del_node(ip: str):
+    with LOCK:
+        st = _load_state()
+        st["nodes"] = [x for x in st["nodes"] if str(x["ip"]) != ip]
+        _save_state(st)
+        return st["nodes"]
+
+
 # ===== Proxy Provisioning (SSH) =====
 @app.post("/v1/proxies/provision", dependencies=[Depends(require_internal)])
 def provision_proxy(req: ProvisionRequest, request: Request):

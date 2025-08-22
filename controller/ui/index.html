@@ -56,7 +56,7 @@
     .cell-actions .input-inline{ flex-wrap: nowrap; }
     /* nodes table tuning */
     .nodes-table th, .nodes-table td { vertical-align: middle; font-size:13px; }
-    .nodes-table .cell-actions{ min-width: 190px; }
+    .nodes-table .cell-actions{ min-width: 260px; }
     .cell-ip{ direction:ltr; white-space: nowrap; min-width:120px; }
     .cell-ip code{ overflow-wrap: normal; word-break: normal; }
     .btn-details, .btn-toggle{ min-width:84px; text-align:center; }
@@ -424,6 +424,7 @@ async function loadNodes(){
         <div class="input-inline" style="gap:6px;">
           <button class="btn-details">جزئیات</button>
           <button class="btn-toggle">${n.enabled ? 'غیرفعال' : 'فعال'}</button>
+          <button class="btn-del" style="background-color:#e74c3c; color:white;">حذف</button>
         </div>
       </td>
     `;
@@ -516,6 +517,14 @@ async function loadNodes(){
       const path = n.enabled ? `/v1/nodes/${ip}/disable` : `/v1/nodes/${ip}/enable`;
       const r = await api(path, { method:'POST' });
       if(!r.ok){ const t = await r.text(); alert('خطا در تغییر وضعیت نود: ' + t); return; }
+      await loadNodes();
+    };
+    // delete node
+    tr.querySelector('.btn-del').onclick = async () => {
+      if(!confirm('این نود حذف شود؟')) return;
+      const ip = encodeURIComponent(n.ip);
+      const r = await api(`/v1/nodes/${ip}`, { method:'DELETE' });
+      if(!r.ok){ const t = await r.text(); alert('خطا در حذف نود: ' + t); return; }
       await loadNodes();
     };
     // restart services handler
