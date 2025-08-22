@@ -9,7 +9,7 @@ import subprocess
 import time
 from urllib.request import urlopen
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel, IPvAnyAddress
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -28,6 +28,28 @@ app = FastAPI(title="DNS+SNI Control Plane")
 UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
 if os.path.isdir(UI_DIR):
     app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
+
+# ===== Internal Auth (Site ↔ Controller) =====
+# If env INTERNAL_TOKEN is set, mutating endpoints must include a valid token via
+# header 'X-Internal-Token: <token>' or 'Authorization: Bearer <token>'.
+def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+    if not auth_header:
+        return None
+    m = re.match(r"Bearer\s+(.+)", auth_header, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def require_internal(request: Request):
+    expected = (os.environ.get("INTERNAL_TOKEN") or "").strip()
+    # When not configured, treat as open (no auth enforced)
+    if not expected:
+        return
+    token = request.headers.get("X-Internal-Token")
+    if not token:
+        token = _extract_bearer_token(request.headers.get("Authorization"))
+    if token != expected:
+        raise HTTPException(status_code=403, detail="forbidden")
 
 @app.get("/")
 def root():
@@ -156,7 +178,7 @@ def list_clients():
         return st["clients"]
 
 
-@app.post("/v1/clients", response_model=List[Client])
+@app.post("/v1/clients", response_model=List[Client], dependencies=[Depends(require_internal)])
 def add_client(c: Client):
     with LOCK:
         st = _load_state()
@@ -169,7 +191,7 @@ def add_client(c: Client):
         return st["clients"]
 
 
-@app.delete("/v1/clients/{ip}", response_model=List[Client])
+@app.delete("/v1/clients/{ip}", response_model=List[Client], dependencies=[Depends(require_internal)])
 def del_client(ip: str):
     with LOCK:
         st = _load_state()
@@ -188,7 +210,7 @@ def get_flags():
         }
 
 
-@app.post("/v1/flags")
+@app.post("/v1/flags", dependencies=[Depends(require_internal)])
 def set_flags(f: FlagsPayload):
     with LOCK:
         st = _load_state()
@@ -210,7 +232,7 @@ def list_nodes():
         return st["nodes"]
 
 
-@app.post("/v1/nodes", response_model=List[Node])
+@app.post("/v1/nodes", response_model=List[Node], dependencies=[Depends(require_internal)])
 def upsert_node(n: NodeIn, request: Request):
     with LOCK:
         st = _load_state()
@@ -266,7 +288,7 @@ def upsert_node(n: NodeIn, request: Request):
         return st["nodes"]
 
 
-@app.post("/v1/nodes/{ip}/enable", response_model=List[Node])
+@app.post("/v1/nodes/{ip}/enable", response_model=List[Node], dependencies=[Depends(require_internal)])
 def enable_node(ip: str):
     with LOCK:
         st = _load_state()
@@ -277,7 +299,7 @@ def enable_node(ip: str):
         return st["nodes"]
 
 
-@app.post("/v1/nodes/{ip}/disable", response_model=List[Node])
+@app.post("/v1/nodes/{ip}/disable", response_model=List[Node], dependencies=[Depends(require_internal)])
 def disable_node(ip: str):
     with LOCK:
         st = _load_state()
@@ -289,7 +311,7 @@ def disable_node(ip: str):
 
 
 # ===== Proxy Provisioning (SSH) =====
-@app.post("/v1/proxies/provision")
+@app.post("/v1/proxies/provision", dependencies=[Depends(require_internal)])
 def provision_proxy(req: ProvisionRequest, request: Request):
     """Provision a remote host as Proxy node via SSH.
     Does NOT store credentials; executes a bootstrap script remotely.
@@ -471,7 +493,7 @@ echo "[+] done"
         except Exception:
             pass
 
-@app.post("/v1/nodes/{ip}/restart")
+@app.post("/v1/nodes/{ip}/restart", dependencies=[Depends(require_internal)])
 def restart_node_services(ip: str, req: RestartRequest):
     """Restart one or more services on a remote node via SSH (agent, coredns, sniproxy).
     Does NOT store credentials; returns aggregated logs from remote execution.
@@ -609,7 +631,7 @@ echo "[+] done"
 
     return {"ok": True, "services": services, "log": "\n".join(log_lines)}
 
-@app.post("/v1/domains/sync")
+@app.post("/v1/domains/sync", dependencies=[Depends(require_internal)])
 def bump_domains_version():
     with LOCK:
         st = _load_state()
@@ -624,7 +646,7 @@ def get_domains():
         st = _load_state()
         return st.get("domains", [])
 
-@app.post("/v1/domains", response_model=List[str])
+@app.post("/v1/domains", response_model=List[str], dependencies=[Depends(require_internal)])
 def set_domains(payload: DomainsPayload):
     with LOCK:
         st = _load_state()
@@ -645,7 +667,7 @@ def set_domains(payload: DomainsPayload):
         _save_state(st)
         return st["domains"]
 
-@app.post("/v1/domains/add", response_model=List[str])
+@app.post("/v1/domains/add", response_model=List[str], dependencies=[Depends(require_internal)])
 def add_domain(item: DomainItem):
     with LOCK:
         st = _load_state()
@@ -658,7 +680,7 @@ def add_domain(item: DomainItem):
             _save_state(st)
         return st.get("domains", [])
 
-@app.delete("/v1/domains/{domain}", response_model=List[str])
+@app.delete("/v1/domains/{domain}", response_model=List[str], dependencies=[Depends(require_internal)])
 def delete_domain(domain: str):
     with LOCK:
         st = _load_state()
@@ -670,25 +692,7 @@ def delete_domain(domain: str):
         _save_state(st)
         return st.get("domains", [])
 
-
-class Flags(BaseModel):
-    enforce_dns_clients: Optional[bool] = None
-    enforce_proxy_clients: Optional[bool] = None
-
-
-@app.post("/v1/flags")
-def set_flags(flags: Flags):
-    with LOCK:
-        st = _load_state()
-        if flags.enforce_dns_clients is not None:
-            st["enforce_dns_clients"] = bool(flags.enforce_dns_clients)
-        if flags.enforce_proxy_clients is not None:
-            st["enforce_proxy_clients"] = bool(flags.enforce_proxy_clients)
-        _save_state(st)
-        return {
-            "enforce_dns_clients": st["enforce_dns_clients"],
-            "enforce_proxy_clients": st["enforce_proxy_clients"],
-        }
+ # Note: duplicate /v1/flags endpoint removed (see earlier FlagsPayload + set_flags)
 
 # Optional: set git_repo and git_branch via API
 class GitSettings(BaseModel):
@@ -696,7 +700,7 @@ class GitSettings(BaseModel):
     git_branch: Optional[str] = None
 
 
-@app.post("/v1/git")
+@app.post("/v1/git", dependencies=[Depends(require_internal)])
 def set_git(settings: GitSettings):
     with LOCK:
         st = _load_state()
@@ -752,7 +756,7 @@ def _copy_tree(src: str, dst: str):
             shutil.copy2(os.path.join(root, f), os.path.join(target_root, f))
 
 
-@app.post("/v1/code")
+@app.post("/v1/code", dependencies=[Depends(require_internal)])
 def set_code_repo(settings: CodeSettings):
     with LOCK:
         st = _load_state()
@@ -764,7 +768,7 @@ def set_code_repo(settings: CodeSettings):
         return {"code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 
 
-@app.post("/v1/nodes/update")
+@app.post("/v1/nodes/update", dependencies=[Depends(require_internal)])
 def update_nodes(settings: CodeSettings = None):
     with LOCK:
         st = _load_state()
@@ -791,7 +795,7 @@ def update_nodes(settings: CodeSettings = None):
         }
 
 
-@app.post("/v1/nodes/version")
+@app.post("/v1/nodes/version", dependencies=[Depends(require_internal)])
 def set_agents_version(payload: AgentsVersionPayload):
     """Set the agents_version explicitly (or bump by 1 if not provided).
     Optionally update code_repo/code_branch alongside.
@@ -813,7 +817,7 @@ def set_agents_version(payload: AgentsVersionPayload):
         return {"agents_version": st["agents_version"], "code_repo": st["code_repo"], "code_branch": st["code_branch"]}
 
 
-@app.post("/v1/nodes/force-reset")
+@app.post("/v1/nodes/force-reset", dependencies=[Depends(require_internal)])
 def force_reset_agents():
     """Force reset all agents by resetting their applied version to 0 and bumping target version.
     This will trigger a fresh sync cycle for all agents.
@@ -833,7 +837,7 @@ def force_reset_agents():
         }
 
 
-@app.post("/v1/code/self-update")
+@app.post("/v1/code/self-update", dependencies=[Depends(require_internal)])
 def self_update_controller():
     """Download latest code and update controller files and UI, then restart service in background."""
     with LOCK:

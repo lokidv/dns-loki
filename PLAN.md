@@ -10,7 +10,7 @@ A concise, actionable plan showing current status, exactly what to do now, and t
 - اسکریپت نصب و اجزای سیستم آمادهٔ استقرار هستند (`scripts/install.sh`، `controller/api.py`، `agent/agent.py`).
 - فعلاً فقط نود DNS ایران با IP `185.84.158.34` در حال پیشروی است. نود دوم ایران `87.248.154.86` هنوز نصب نشده.
 - سه سرور آمریکا برای Proxy آماده‌اند ولی هنوز نصب نشده‌اند.
-- Enforcement فعلاً خاموش است تا پس از تست کامل فعال شود.
+- Enforcement برای DNS به‌صورت پیش‌فرض روشن است و برای Proxy می‌تواند پس از تست فعال شود.
 
 ### فهرست سرورها (Inventory)
 - Proxyهای آمریکا:
@@ -28,9 +28,7 @@ apt-get update -y && apt-get install -y git
 git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role proxy \
-  --controller-url http://<CONTROLLER_IP>:8080 \
-  --git-repo https://github.com/lokidv/dmlist.git \
-  --git-branch main
+  --controller-url http://<CONTROLLER_IP>:8080
 ```
 سرورهای آمریکا که باید این دستور روی آن‌ها اجرا شود:
 - 144.172.98.5
@@ -43,12 +41,15 @@ curl -sS http://<CONTROLLER_IP>:8080/v1/nodes | jq .
 # در صورت نبودن هر IP در خروجی، دستی اضافه کنید (برای هر Proxy یکبار):
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/nodes \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"144.172.98.5","role":"proxy","enabled":true}' | jq .
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/nodes \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"144.172.103.229","role":"proxy","enabled":true}' | jq .
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/nodes \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"144.172.103.230","role":"proxy","enabled":true}' | jq .
 ```
 
@@ -58,14 +59,13 @@ apt-get update -y && apt-get install -y git
 git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role dns \
-  --controller-url http://<CONTROLLER_IP>:8080 \
-  --git-repo https://github.com/lokidv/dmlist.git \
-  --git-branch main
+  --controller-url http://<CONTROLLER_IP>:8080
 ```
 
 4) همگام‌سازی دامنه‌ها و بررسی فایل‌های override روی نود DNS
 ```bash
-curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/domains/sync | jq .
+curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/domains/sync \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' | jq .
 sed -n '1,200p' /opt/dns-proxy/docker/dns/targets.override
 sed -n '1,200p' /opt/dns-proxy/docker/dns/v6block.override
 ```
@@ -95,15 +95,17 @@ curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/clients -H 'Content-Type: applic
 2) روشن کردن فلگ‌های محدودسازی
 ```bash
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/flags -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"enforce_dns_clients": true}' | jq .
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/flags -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"enforce_proxy_clients": true}' | jq .
 ```
 
 ### گام‌های آینده (Roadmap کوتاه)
 - نصب نود DNS دوم در ایران روی `87.248.154.86` و قرار دادن هر دو DNS در دسترس مشتری.
-- راه‌اندازی GitHub Webhook برای Sync خودکار `domains.lst`.
-- افزودن احراز هویت ساده به Controller و داشبورد وضعیت.
+- اتصال کامل Site ↔ Controller با توکن داخلی (مدیریت دامنه‌ها، کاربران، پلن‌ها).
+- بهبود داشبورد وضعیت و مانیتورینگ سرویس‌ها.
 
 ---
 
@@ -134,8 +136,7 @@ git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role proxy \
   --controller-url http://<CONTROLLER_IP>:8080 \
-  --git-repo https://github.com/lokidv/dmlist.git \
-  --git-branch main
+  
 ```
 - Expect: sniproxy container up, UDP/443 blocked by nftables, agent started.
 
@@ -145,6 +146,7 @@ curl -sS http://<CONTROLLER_IP>:8080/v1/nodes | jq .
 # If missing, add manually:
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/nodes \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"<PROXY_PUBLIC_IP>","role":"proxy","enabled":true}' | jq .
 ```
 
@@ -155,14 +157,14 @@ git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role dns \
   --controller-url http://<CONTROLLER_IP>:8080 \
-  --git-repo https://github.com/lokidv/dmlist.git \
-  --git-branch main
+  
 ```
 - Expect: CoreDNS via Docker (or native fallback) up, agent started, base nft rules applied.
 
 4) Trigger domain sync and verify overrides on DNS node
 ```bash
-curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/domains/sync | jq .
+curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/domains/sync \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' | jq .
 # On the DNS node, verify the generated targets (should point A records to proxy IPs):
 sed -n '1,200p' /opt/dns-proxy/docker/dns/targets.override
 sed -n '1,200p' /opt/dns-proxy/docker/dns/v6block.override
@@ -198,8 +200,7 @@ git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role controller \
   --bind 0.0.0.0:8080 \
-  --git-repo https://github.com/lokidv/dmlist.git \
-  --git-branch main
+  
 
 # Optional hardening later: set HOST=127.0.0.1 in /opt/dns-proxy/controller/.env and restart service
 ```
@@ -213,16 +214,19 @@ sudo ./scripts/install.sh \
 # Allow only DNS
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/clients \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"<CLIENT_IP>","note":"customer1","scope":["dns"]}' | jq .
 
 # Allow only Proxy
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/clients \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"<CLIENT_IP>","note":"customer1","scope":["proxy"]}' | jq .
 
 # Allow both DNS+Proxy
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/clients \
   -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
   -d '{"ip":"<CLIENT_IP>","note":"customer1","scope":["dns","proxy"]}' | jq .
 ```
 
@@ -242,23 +246,21 @@ Agent on nodes will update nftables sets `allow_dns_clients` and `allow_proxy_cl
 
 ---
 
-## 5) Automation with Git webhook
+## 5) Automation and integration (Site ↔ Controller)
 
-- In repo `lokidv/dmlist`, create a GitHub Webhook:
-  - Payload URL: `http://<CONTROLLER_PUBLIC_IP>:8080/v1/domains/sync`
-  - Content type: `application/json`
-  - Trigger: `push` (later add secret/signature for security)
-- Any push to `domains.lst` triggers Controller to sync and agents to update overrides.
+- منبع واحد حقیقت برای دامنه‌ها پایگاه‌داده Controller است که از طریق سرویس Site (Laravel + MySQL) مدیریت می‌شود.
+- ارتباط داخلی Site با Controller باید با هدر `X-Internal-Token` انجام شود.
+- دیگر از GitHub/dmlist یا Webhook برای همگام‌سازی استفاده نمی‌کنیم.
 
 ---
 
 ## 6) Architecture (short)
 
-- Controller API (`controller/api.py`) manages domains sync, clients, flags, and registry of nodes.
-- DNS node(s) in Iran: CoreDNS rewrites A records of domains in `domains.lst` to Proxy IP(s); AAAA blocked.
-- Proxy node(s) outside Iran: sniproxy forwards HTTP/HTTPS by SNI/Host to real origin; UDP/443 blocked -> forces HTTP/2 when needed.
-- Agent on each node enforces client IP allow-lists via nftables and keeps services/config in sync.
-- Domain list is the SSoT in Git: `dmlist/domains.lst`.
+- Controller API (`controller/api.py`) مدیریت Sync دامنه‌ها، مشتریان، فلگ‌ها و رجیستری نودها را برعهده دارد.
+- DNS در ایران: CoreDNS رکوردهای A دامنه‌های تعریف‌شده را به IPهای Proxy بازنویسی می‌کند؛ AAAA مسدود است.
+- Proxy خارج از ایران: sniproxy بر اساس SNI/Host فوروارد می‌کند؛ UDP/443 مسدود برای ترجیح HTTP/2.
+- Agent روی هر نود لیست IPهای مجاز را با nftables اعمال کرده و سرویس‌ها/کانفیگ را Sync می‌کند.
+- منبع واحد حقیقت برای دامنه‌ها دیتابیس Controller است؛ مدیریت از طریق Site (Laravel + MySQL) انجام می‌شود.
 
 ---
 
@@ -279,7 +281,7 @@ Agent on nodes will update nftables sets `allow_dns_clients` and `allow_proxy_cl
 - DNS answers A for domains in `domains.lst` with only Proxy IP(s); AAAA suppressed.
 - HTTP/HTTPS traffic for those domains successfully passes via sniproxy outside Iran.
 - Only allowed client IPs (as configured) can use DNS and Proxy when enforcement = true.
-- Git push to `domains.lst` updates all nodes automatically (via webhook or manual sync).
+- تغییرات دامنه در Site/Controller باعث به‌روزرسانی نودها (از طریق `/v1/domains/sync`) می‌شود.
 - System remains operable even if Docker registries are blocked (native CoreDNS fallback).
 
 ---
@@ -289,14 +291,14 @@ Agent on nodes will update nftables sets `allow_dns_clients` and `allow_proxy_cl
 - Registry blocks: mitigated by CoreDNS native fallback in installer.
 - Client bypass via Secondary DNS: instruct clients to use only the provided DNS IP; optional network-level enforcement.
 - HTTP/3 quirks: UDP/443 blocked on Proxy to prefer HTTP/2.
-- Controller exposure: bind to 127.0.0.1 or firewall restrict 8080; add auth later.
+- Controller exposure: bind to 127.0.0.1 or firewall restrict 8080; استفاده از INTERNAL_TOKEN برای عملیات حساس.
 
 ---
 
 ## 10) Near-term roadmap (1–3 days)
 
 - [ ] Deploy at least 2 Proxy nodes (HA) and 2 DNS nodes (Iran) — Scenario C ready.
-- [ ] Add simple auth/token to Controller API.
+- [ ] سخت‌سازی بیشتر احراز هویت داخلی Controller و رصد لاگ‌ها.
 - [ ] Add healthcheck UI or status page for nodes/domains.
 - [ ] CI hook to validate `domains.lst` format before merge.
 
@@ -308,4 +310,4 @@ Agent on nodes will update nftables sets `allow_dns_clients` and `allow_proxy_cl
 - [ ] DNS node deployed and serving A answers pointing to Proxy IP(s).
 - [ ] Client tested successfully through the system.
 - [ ] Enforcement enabled for your customer IP(s).
-- [ ] Webhook configured for auto-sync.
+- [ ] INTERNAL_TOKEN روی Controller تنظیم شده و درخواست‌های حساس با آن ارسال می‌شوند.

@@ -60,3 +60,35 @@ systemctl restart dns-proxy-controller
 # 5) بررسی وضعیت و لاگ‌ها
 systemctl status --no-pager -l dns-proxy-controller
 journalctl -u dns-proxy-controller -n 100 --no-pager
+
+## Internal Token (Site ↔ Controller)
+
+برای امن‌سازی مسیرهای تغییردهندهٔ `controller/api.py`، متغیر محیطی `INTERNAL_TOKEN` را تنظیم کنید. در حالت توسعه اگر این متغیر تنظیم نشود، احراز هویت غیرفعال است.
+
+- تنظیم با systemd override:
+```bash
+sudo systemctl edit dns-proxy-controller
+```
+محتوا:
+```ini
+[Service]
+Environment=INTERNAL_TOKEN=CHANGE_ME_STRONG_SECRET
+```
+سپس:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart dns-proxy-controller
+```
+
+- مثال فراخوانی با هدر `X-Internal-Token`:
+```bash
+curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/clients \
+  -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: CHANGE_ME_STRONG_SECRET' \
+  -d '{"ip":"203.0.113.10","note":"user:42","scope":["dns","proxy"]}'
+```
+
+- مثال فراخوانی با `Authorization: Bearer`:
+```bash
+curl -sS -X DELETE http://<CONTROLLER_IP>:8080/v1/clients/203.0.113.10 \
+  -H 'Authorization: Bearer CHANGE_ME_STRONG_SECRET'
