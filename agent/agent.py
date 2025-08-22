@@ -584,8 +584,8 @@ def main():
                     
                     # Report success to controller
                     try:
-                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5, headers=headers)
+                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
+                        requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=5, headers=headers)
                         log(f"update-apply: reported success to controller")
                     except Exception as e:
                         log(f"update-apply: failed reporting to controller -> {e}")
@@ -605,8 +605,8 @@ def main():
             # Versions match - still report to controller periodically
             if my_ip and agents_version_applied > 0:
                 try:
-                    report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5, headers=headers)
+                    report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
+                    requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=5, headers=headers)
                 except Exception:
                     pass  # Silent fail for periodic reports
 
@@ -766,7 +766,7 @@ def main():
             }
             if my_ip:
                 hb["ip"] = my_ip
-            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5, headers=headers)
         except Exception as e:
             log(f"heartbeat: failed to post -> {e}")
 
