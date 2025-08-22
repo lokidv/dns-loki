@@ -101,6 +101,7 @@ class ConfigOut(BaseModel):
     code_branch: str
     enforce_dns_clients: bool = True
     enforce_proxy_clients: bool = False
+    internal_auth_enabled: bool = False
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -180,6 +181,9 @@ def _save_state(st):
 def get_config():
     with LOCK:
         st = _load_state()
+        # Reflect whether INTERNAL_TOKEN is set in the running process
+        st = dict(st)
+        st["internal_auth_enabled"] = bool((os.environ.get("INTERNAL_TOKEN") or "").strip())
         return st
 
 
