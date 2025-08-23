@@ -521,7 +521,8 @@ def ui_login(username: str = Form(...), password: str = Form(...)):
         cookie_val = _make_ui_session(username, st.get("ui_session_secret") or "")
         ui_path = (st.get("ui_path") or "ui").strip("/")
         resp = RedirectResponse(url=f"/{ui_path}/", status_code=302)
-        resp.set_cookie("ui_session", cookie_val, httponly=True, samesite="lax", max_age=12*3600)
+        # Explicit path ensures consistent overwrite/delete behavior across browsers
+        resp.set_cookie("ui_session", cookie_val, httponly=True, samesite="lax", max_age=12*3600, path="/")
         return resp
 
 @app.get("/logout")
@@ -530,8 +531,11 @@ def ui_logout():
         st = _load_state()
         st = _ensure_state_defaults(st)
         ui_path = (st.get("ui_path") or "ui").strip("/")
-    resp = RedirectResponse(url=f"/{ui_path}/", status_code=302)
-    resp.delete_cookie("ui_session")
+    # Redirect to login immediately after clearing cookies
+    resp = RedirectResponse(url="/login", status_code=302)
+    # Delete cookies set on common paths to avoid stale path-scoped cookies
+    resp.delete_cookie("ui_session", path="/")
+    resp.delete_cookie("ui_session", path="/_ui")
     return resp
 
 
