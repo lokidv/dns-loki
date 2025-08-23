@@ -158,6 +158,9 @@ async def ui_path_router(request: Request, call_next):
 @app.middleware("http")
 async def ui_auth_gate(request: Request, call_next):
     path = request.scope.get("path", "")
+    # Allow login/logout endpoints to be accessed without an existing session
+    if path.startswith("/login") or path.startswith("/logout"):
+        return await call_next(request)
     if path.startswith("/_ui"):
         with LOCK:
             st = _load_state()
@@ -171,7 +174,7 @@ async def ui_auth_gate(request: Request, call_next):
                 # If HTML is acceptable, redirect to login, else 401
                 accept = request.headers.get("accept", "")
                 if "text/html" in accept or "*/*" in accept:
-                    return RedirectResponse(url="/_ui/login")
+                    return RedirectResponse(url="/login")
                 return JSONResponse(status_code=401, content={"detail": "auth required"})
     return await call_next(request)
 
@@ -189,6 +192,9 @@ async def enforce_internal_token_mw(request: Request, call_next):
             protect_reads = bool(st.get("enforce_token_on_reads", False))
     except Exception:
         protect_reads = False
+    # Never enforce internal token on login/logout endpoints
+    if path.startswith("/login") or path.startswith("/logout"):
+        return await call_next(request)
     should_enforce = method in {"POST", "PUT", "PATCH", "DELETE"} or (method in {"GET", "HEAD"} and protect_reads and not path.startswith("/_ui"))
     if expected and should_enforce:
         try:
@@ -480,14 +486,14 @@ def set_ui_settings(payload: UISettingsPayload):
         }
 
 # ===== UI login/logout endpoints =====
-@app.get("/_ui/login")
+@app.get("/login")
 def ui_login_page():
     html = """
     <!doctype html>
     <html><head><meta charset=\"utf-8\"><title>Login</title>
     <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#0b1220;color:#eaeef6}form{background:#111a2c;padding:24px;border-radius:8px;min-width:320px}input{width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #2a3450;background:#0e1726;color:#eaeef6}button{width:100%;padding:10px;background:#3b82f6;border:none;border-radius:6px;color:white;cursor:pointer}h2{text-align:center}</style>
     </head><body>
-    <form method=\"post\" action=\"/\_ui/login\"> 
+    <form method=\"post\" action=\"/login\"> 
       <h2>Controller Login</h2>
       <label>Username</label>
       <input name=\"username\" required>
@@ -499,7 +505,7 @@ def ui_login_page():
     """
     return HTMLResponse(content=html)
 
-@app.post("/_ui/login")
+@app.post("/login")
 def ui_login(username: str = Form(...), password: str = Form(...)):
     with LOCK:
         st = _load_state()
@@ -518,7 +524,7 @@ def ui_login(username: str = Form(...), password: str = Form(...)):
         resp.set_cookie("ui_session", cookie_val, httponly=True, samesite="lax", max_age=12*3600)
         return resp
 
-@app.get("/_ui/logout")
+@app.get("/logout")
 def ui_logout():
     with LOCK:
         st = _load_state()
