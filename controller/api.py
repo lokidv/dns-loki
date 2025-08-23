@@ -161,7 +161,23 @@ async def ui_auth_gate(request: Request, call_next):
     # Allow login/logout endpoints to be accessed without an existing session
     if path.startswith("/login") or path.startswith("/logout"):
         return await call_next(request)
+    # Determine if this request targets the UI (either internal mount or configured external path)
+    protect_ui = False
+    ui_path_val = None
     if path.startswith("/_ui"):
+        protect_ui = True
+    else:
+        try:
+            with LOCK:
+                st_tmp = _load_state()
+                st_tmp = _ensure_state_defaults(st_tmp)
+                ui_path_val = (st_tmp.get("ui_path") or "ui").strip("/")
+        except Exception:
+            ui_path_val = "ui"
+        if ui_path_val and (path == f"/{ui_path_val}" or path.startswith(f"/{ui_path_val}/")):
+            protect_ui = True
+
+    if protect_ui:
         with LOCK:
             st = _load_state()
             st = _ensure_state_defaults(st)
@@ -530,7 +546,9 @@ def ui_logout():
     with LOCK:
         st = _load_state()
         st = _ensure_state_defaults(st)
-        ui_path = (st.get("ui_path") or "ui").strip("/")
+        # Rotate session secret to invalidate any lingering cookies immediately
+        st["ui_session_secret"] = secrets.token_hex(16)
+        _save_state(st)
     # Redirect to login immediately after clearing cookies
     resp = RedirectResponse(url="/login", status_code=302)
     # Delete cookies set on common paths to avoid stale path-scoped cookies
