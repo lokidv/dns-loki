@@ -14,6 +14,7 @@
     .container{ max-width:1200px; margin: 24px auto; padding: 0 16px; overflow-x:hidden; }
     h1{ margin: 0 0 16px 0; font-size: 22px; display:flex; align-items:center; gap:10px; }
     h2{ margin: 0 0 12px 0; font-size: 18px; }
+
     .row { display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap:16px; }
     .col-6{ grid-column: span 6; }
     .col-4{ grid-column: span 4; }
@@ -146,6 +147,31 @@
         <div class="muted" style="margin-top:6px;">در صورتی که متغیر محیطی INTERNAL_TOKEN تنظیم شده باشد، امکان تغییر توکن از طریق UI وجود ندارد.</div>
       </details>
       <details style="margin-top:10px;">
+        <summary>تنظیمات UI (مسیر و ورود)</summary>
+        <div style="margin-top:8px; display:flex; flex-direction:column; gap:10px;">
+          <div class="kv">
+            <b>مسیر فعلی UI</b><div id="uiPathCurrent">—</div>
+            <b>نیاز به ورود</b><div id="uiAuthCurrent">—</div>
+          </div>
+          <div class="divider"></div>
+          <div class="input-inline" style="gap:8px; flex-wrap:wrap; align-items:center;">
+            <input id="uiPathInput" placeholder="مثلاً example" style="min-width:200px;" />
+            <button id="btnSaveUiPath">ثبت مسیر</button>
+            <button id="btnOpenUi" style="background-color:#444; color:white;">باز کردن مسیر</button>
+            <span class="muted">مسیر خارجی UI از <code>/{ui_path}</code> به مسیر داخلی <code>/_ui</code> نگاشت می‌شود.</span>
+          </div>
+          <div class="divider"></div>
+          <div class="input-inline" style="gap:8px; flex-wrap:wrap; align-items:center;">
+            <label><input type="checkbox" id="uiAuthEnabled" /> نیاز به ورود (Username/Password)</label>
+            <input id="uiUsername" placeholder="نام کاربری" style="min-width:160px;" />
+            <input id="uiPassword" type="password" placeholder="رمز عبور (برای تنظیم/تغییر)" style="min-width:200px;" />
+            <button id="btnSaveUiAuth" class="btn-primary">ذخیره ورود</button>
+            <button id="btnLogoutUi" style="background-color:#444; color:white;">خروج</button>
+          </div>
+          <div class="muted">در صورت فعال‌سازی، دسترسی به UI نیازمند ورود است و از طریق <code>/_ui/login</code> انجام می‌شود.</div>
+        </div>
+      </details>
+      <details style="margin-top:10px;">
         <summary>اعمال محدودیت دسترسی (enforce)</summary>
         <div style="margin-top:8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
           <label><input type="checkbox" id="flagDns" /> Enforce DNS</label>
@@ -246,6 +272,45 @@ const api = (path, opts={}) => {
 };
 let APP = { cfg: null, refreshTimer: null, domainsAll: [] };
 
+// moved from <style>: load UI settings from controller
+async function loadUiSettings(){
+  try{
+    const r = await api('/v1/ui/settings');
+    if(!r.ok) return;
+    const j = await r.json();
+    const currPath = (j.ui_path || 'ui').replace(/^\/+|\/+$/g,'');
+    const pCur = document.getElementById('uiPathCurrent');
+    const pInp = document.getElementById('uiPathInput');
+    const aCur = document.getElementById('uiAuthCurrent');
+    const aChk = document.getElementById('uiAuthEnabled');
+    const uInp = document.getElementById('uiUsername');
+    if(pCur) pCur.textContent = `/${currPath}/`;
+    if(pInp) pInp.value = currPath;
+    if(aCur) aCur.textContent = j.ui_auth_enabled ? 'فعال' : 'غیرفعال';
+    if(aChk) aChk.checked = !!j.ui_auth_enabled;
+    if(uInp) uInp.value = j.ui_username || '';
+  }catch(e){ /* ignore */ }
+}
+
+// implement server token status loader
+async function loadServerTokenStatus(){
+  try{
+    const r = await api('/v1/internal-token');
+    if(!r.ok) return;
+    const j = await r.json();
+    const en = document.getElementById('serverTokenEnabled');
+    const src = document.getElementById('serverTokenSource');
+    const note = document.getElementById('serverTokenNote');
+    const bSet = document.getElementById('btnSetServerToken');
+    const bClr = document.getElementById('btnClearServerToken');
+    if(en) en.textContent = j.enabled ? 'فعال' : 'غیرفعال';
+    if(src) src.textContent = j.source || 'none';
+    if(note) note.textContent = (j.source === 'env') ? 'توکن از محیط بارگذاری شده و قابل تغییر نیست.' : '';
+    if(bSet) bSet.disabled = (j.can_set === false);
+    if(bClr) bClr.disabled = (j.source === 'env') || !j.has_state_token;
+  }catch(e){ /* ignore */ }
+}
+
 async function loadConfig(){
   const r = await api('/v1/config');
   const j = await r.json();
@@ -279,31 +344,11 @@ async function loadConfig(){
 }
 
 function updateTokenUI(){
-  const el = document.getElementById('tokenStatus');
-  if(!el) return;
   const t = getInternalToken();
-  el.textContent = t ? 'توکن تنظیم شده است.' : 'توکن تنظیم نشده است.';
+  const el = document.getElementById('tokenStatus');
   const inp = document.getElementById('internalTokenInput');
-  if (inp && t) inp.value = t;
-}
-
-async function loadServerTokenStatus(){
-  try{
-    const r = await api('/v1/internal-token');
-    const j = await r.json();
-    const en = document.getElementById('serverTokenEnabled');
-    const src = document.getElementById('serverTokenSource');
-    const note = document.getElementById('serverTokenNote');
-    const bSet = document.getElementById('btnSetServerToken');
-    const bClr = document.getElementById('btnClearServerToken');
-    if(en) en.textContent = j.enabled ? 'فعال' : 'غیرفعال';
-    if(src) src.textContent = j.source || 'none';
-    if(note) note.textContent = (j.source === 'env') ? 'توکن از محیط بارگذاری شده و قابل تغییر نیست.' : '';
-    if(bSet) bSet.disabled = (j.source === 'env');
-    if(bClr) bClr.disabled = (j.source === 'env') || !j.has_state_token;
-  }catch(e){
-    // ignore
-  }
+  if(inp) inp.value = t || '';
+  if(el) el.textContent = t ? 'توکن مرورگر: ذخیره‌شده' : 'توکن مرورگر: تنظیم نشده';
 }
 
 function renderDomains(){
@@ -573,12 +618,57 @@ async function loadNodes(){
 }
 
 async function init(){
-  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
   updateTokenUI();
-  await loadServerTokenStatus();
 }
 
 init();
+
+// UI settings handlers (moved out of api())
+document.getElementById('btnSaveUiPath')?.addEventListener('click', async () => {
+  const raw = (document.getElementById('uiPathInput')?.value || '').trim();
+  const v = raw.replace(/^\/+|\/+$/g, '');
+  if(!v){ alert('مسیر معتبر وارد کنید (مثلاً example)'); return; }
+  try{
+    const r = await api('/v1/ui/settings', { method:'POST', body: JSON.stringify({ ui_path: v }) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در ثبت مسیر: ' + t); return; }
+    await loadUiSettings();
+    alert(`ثبت شد. از این پس UI در مسیر /${v}/ در دسترس است.`);
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+
+document.getElementById('btnOpenUi')?.addEventListener('click', async () => {
+  try{
+    const r = await api('/v1/ui/settings');
+    if(!r.ok){ window.open('/ui/', '_blank'); return; }
+    const j = await r.json();
+    const currPath = (j.ui_path || 'ui').replace(/^\/+|\/+$/g,'');
+    const url = `${location.origin}/${currPath}/`;
+    window.open(url, '_blank');
+  }catch(e){ window.open('/ui/', '_blank'); }
+});
+
+document.getElementById('btnSaveUiAuth')?.addEventListener('click', async () => {
+  const enabled = !!document.getElementById('uiAuthEnabled')?.checked;
+  const username = (document.getElementById('uiUsername')?.value || '').trim();
+  const password = (document.getElementById('uiPassword')?.value || '').trim();
+  const payload = { ui_auth_enabled: enabled };
+  if(username) payload.ui_username = username;
+  if(password) payload.ui_password = password;
+  try{
+    const r = await api('/v1/ui/settings', { method:'POST', body: JSON.stringify(payload) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در ذخیره تنظیمات ورود: ' + t); return; }
+    (document.getElementById('uiPassword')||{}).value = '';
+    await loadUiSettings();
+    alert('تنظیمات ورود ذخیره شد. در صورت فعال بودن، با باز کردن UI به صفحه ورود هدایت می‌شوید.');
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+
+document.getElementById('btnLogoutUi')?.addEventListener('click', () => {
+  location.href = '/_ui/logout';
+});
 
 // add client handler
 document.getElementById('btnAddClient')?.addEventListener('click', async () => {
@@ -618,11 +708,17 @@ document.getElementById('btnSaveToken')?.addEventListener('click', () => {
   if(!v){ alert('توکن را وارد کنید'); return; }
   try { localStorage.setItem('INTERNAL_TOKEN', v); } catch(e){}
   updateTokenUI();
+  // Immediately refresh server-visible state now that requests include the token
+  loadServerTokenStatus();
+  loadUiSettings();
   alert('توکن ذخیره شد.');
 });
 document.getElementById('btnClearToken')?.addEventListener('click', () => {
   try { localStorage.removeItem('INTERNAL_TOKEN'); } catch(e){}
   updateTokenUI();
+  // Reflect loss of auth in server status and UI settings (may 401 internally and be ignored)
+  loadServerTokenStatus();
+  loadUiSettings();
   alert('توکن پاک شد.');
 });
 
@@ -686,11 +782,12 @@ syncBtn.onclick = async ()=>{
   const r = await api('/v1/domains/sync', { method:'POST' });
   if(!r.ok){ const t = await r.text(); alert('خطا در سینک: ' + t); return; }
   await loadConfig();
+  await loadUiSettings();
 };
 
 // manual refresh
 document.getElementById('btnRefresh').onclick = async ()=>{
-  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings()]);
   await loadServerTokenStatus();
 };
 
@@ -699,7 +796,7 @@ document.getElementById('autoRefresh').addEventListener('change', (e)=>{
   if(e.target.checked){
     if(APP.refreshTimer) clearInterval(APP.refreshTimer);
     APP.refreshTimer = setInterval(async ()=>{
-      await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes()]);
+      await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings()]);
       await loadServerTokenStatus();
     }, 10000);
   } else {
