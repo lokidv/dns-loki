@@ -441,7 +441,7 @@ def _ensure_acl_symlink():
     """
     try:
         Path("/etc/coredns").mkdir(parents=True, exist_ok=True)
-        for name in ("acl.override", "targets.override", "v6block.override"):
+        for name in ("acl.override", "targets.override", "v6block.override", "bypass.zones"):
             src = Path(f"{DEF_CORE_DNS_DIR}/{name}")
             dst = Path(f"/etc/coredns/{name}")
             # Always replace destination with a symlink to src (ln -sf semantics)
@@ -509,10 +509,13 @@ def render_coredns_acl(dns_clients, enforce: bool):
 
 
 def reload_coredns():
-    # If running via Docker, send HUP to PID 1 in the container
+    # If running via Docker, reconcile compose (volumes) and try HUP
     try:
         res = run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml ps -q coredns", check=False)
-        if res.returncode == 0 and res.stdout and res.stdout.strip():
+        if res.returncode == 0 and res.stdout is not None:
+            # Ensure service is up and pick up any compose/mount changes
+            run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml up -d coredns", check=False)
+            # Attempt fast reload; harmless if container restarted
             run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml exec -T coredns kill -HUP 1", check=False)
             return
     except Exception:

@@ -203,7 +203,30 @@
       </details>
     </div>
   </div>
-
+  
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-6">
+      <h2>Fly Bypass</h2>
+      <div class="grid-2">
+        <div class="input-inline">
+          <input id="bypassInput" placeholder="example.com" />
+          <button id="btnAddBypass" class="btn-primary">افزودن</button>
+        </div>
+      </div>
+      <div class="input-inline" style="margin:8px 0;">
+        <input id="bypassSearch" placeholder="جستجو در بای‌پس..." style="width:100%;" />
+      </div>
+      <div id="bypassList" style="max-height:260px; overflow:auto; border:1px solid var(--border); border-radius:10px;">
+        <table class="table-sticky" style="margin-top:0; width:100%; border-collapse:collapse;">
+          <thead><tr><th>دامنه</th><th>عملیات</th></tr></thead>
+          <tbody id="bypassBody"></tbody>
+        </table>
+      </div>
+      <div class="count" id="bypassCount"></div>
+      <div class="muted">دامنه‌های این لیست در حالت Fly Mode به صورت مستقیم (بدون پراکسی) resolve می‌شوند.</div>
+    </div>
+  </div>
+ 
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
       <h2>کلاینت‌ها</h2>
@@ -480,6 +503,9 @@ async function loadTelemetryTop(){
               <button class="btnPromoteSuffix" data-d="${row.domain}">افزودن ریشه</button>
             </div>
           `}
+          <div class="input-inline" style="gap:6px; margin-top:4px;">
+            <button class="btnBypass" data-d="${row.domain}">بای‌پس</button>
+          </div>
         </td>
       `;
       body.appendChild(tr);
@@ -521,6 +547,17 @@ async function loadTelemetryTop(){
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
     });
+    body.querySelectorAll('.btnBypass').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        try{
+          const r2 = await api('/v1/fly-bypass/add', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن بای‌پس: ' + t); return; }
+          await loadFlyBypass();
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
     if(loading) loading.style.display = 'none';
   }catch(e){
     document.getElementById('teleCount').textContent = 'خطا در تله‌متری: ' + (e?.message || e);
@@ -559,6 +596,7 @@ async function loadTelemetryRecents(){
           <div class="input-inline" style="gap:6px;">
             <button class="btnRecPromote" data-d="${e.domain}">افزودن دامنه</button>
             <button class="btnRecPromoteSuffix" data-d="${e.domain}">افزودن ریشه</button>
+            <button class="btnRecBypass" data-d="${e.domain}">بای‌پس</button>
           </div>
         </td>
       `;
@@ -587,6 +625,17 @@ async function loadTelemetryRecents(){
           // Auto sync
           await api('/v1/domains/sync', { method:'POST' });
           await Promise.all([loadDomains(), loadConfig()]);
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
+    body.querySelectorAll('.btnRecBypass').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        try{
+          const r2 = await api('/v1/fly-bypass/add', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن بای‌پس: ' + t); return; }
+          await loadFlyBypass();
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
     });
@@ -683,7 +732,7 @@ document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
     alert('پاک شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
-let APP = { cfg: null, refreshTimer: null, domainsAll: [], clientsAll: [], teleTopItems: [], recItems: [], activeView: 'home' };
+let APP = { cfg: null, refreshTimer: null, domainsAll: [], flyBypassAll: [], clientsAll: [], teleTopItems: [], recItems: [], activeView: 'home' };
 
 // Helpers: badge, CSV, filters persistence
 function updateHistoryBadge(){
@@ -758,7 +807,7 @@ function setActiveTab(){
 async function refreshActive(){
   if(APP.activeView === 'home'){
     await Promise.all([
-      loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings(),
+      loadConfig(), loadDomains(), loadFlyBypass(), loadClients(), loadNodes(), loadUiSettings(),
     ]);
     await loadServerTokenStatus();
   } else {
@@ -881,6 +930,35 @@ async function loadDomains(){
   const r = await api('/v1/domains');
   APP.domainsAll = await r.json();
   renderDomains();
+}
+
+async function loadFlyBypass(){
+  try{
+    const r = await api('/v1/fly-bypass');
+    if(!r.ok) return;
+    const arr = await r.json();
+    APP.flyBypassAll = Array.isArray(arr) ? arr : [];
+    renderFlyBypass();
+  }catch(_){ /* ignore */ }
+}
+
+function renderFlyBypass(){
+  const body = document.getElementById('bypassBody'); if(!body) return;
+  const q = (document.getElementById('bypassSearch')?.value || '').trim().toLowerCase();
+  const list = q ? (APP.flyBypassAll||[]).filter(d => (d||'').toLowerCase().includes(q)) : (APP.flyBypassAll||[]).slice();
+  body.innerHTML = '';
+  list.forEach(d => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><code>${d}</code></td><td class="row-actions"><button class="btnDelBypass" data-d="${d}">حذف</button></td>`;
+    tr.querySelector('.btnDelBypass').onclick = async (ev) => {
+      const dom = ev.target.getAttribute('data-d');
+      const r = await api(`/v1/fly-bypass/${encodeURIComponent(dom)}`, { method:'DELETE' });
+      if(!r.ok){ const t = await r.text(); alert('خطا در حذف بای‌پس: ' + t); return; }
+      await loadFlyBypass();
+    };
+    body.appendChild(tr);
+  });
+  const cnt = document.getElementById('bypassCount'); if(cnt){ cnt.textContent = `تعداد: ${list.length} از ${(APP.flyBypassAll||[]).length}`; }
 }
 
 function renderClients(){
@@ -1144,7 +1222,7 @@ async function loadNodes(){
 
 async function init(){
   // initial load for home
-  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
+  await Promise.all([loadConfig(), loadDomains(), loadFlyBypass(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
   updateTokenUI();
 }
 
@@ -1305,6 +1383,24 @@ if(domSearch){ domSearch.addEventListener('input', renderDomains); }
 
 // sync button
 const syncBtn = document.getElementById('syncBtn');
+
+// fly bypass handlers
+const bypassSearch = document.getElementById('bypassSearch');
+if(bypassSearch){ bypassSearch.addEventListener('input', renderFlyBypass); }
+const btnAddBypass = document.getElementById('btnAddBypass');
+if(btnAddBypass){
+  btnAddBypass.addEventListener('click', async ()=>{
+    const dom = (document.getElementById('bypassInput')?.value || '').trim();
+    if(!dom){ alert('دامنه را وارد کنید'); return; }
+    try{
+      const r = await api('/v1/fly-bypass/add', { method:'POST', body: JSON.stringify({ domain: dom }) });
+      const t = await r.text();
+      if(!r.ok){ alert('خطا در افزودن بای‌پس: ' + t); return; }
+      (document.getElementById('bypassInput')||{}).value = '';
+      await loadFlyBypass();
+    }catch(e){ alert('خطا: ' + (e?.message || e)); }
+  });
+}
 
 // clients search handler
 const clSearch = document.getElementById('clientsSearch');
