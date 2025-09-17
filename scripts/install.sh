@@ -14,6 +14,8 @@ BIND="0.0.0.0:8080"
 CONTROLLER_URL=""
 GIT_REPO=""
 GIT_BRANCH="main"
+# Default internal token for controller <-> agents/UI
+DEFAULT_INTERNAL_TOKEN="thisistoken"
 COREDNS_VERSION="v1.11.1"
 
 while [[ $# -gt 0 ]]; do
@@ -215,6 +217,8 @@ health_check_interval_seconds: 10
 # Enforcement toggles (set true later when ready to lock down)
 enforce_dns_clients: true
 enforce_proxy_clients: false
+# Internal auth token used for authenticating to controller APIs
+internal_token: "${DEFAULT_INTERNAL_TOKEN}"
 EOF
 
 # Ensure nftables is enabled
@@ -230,6 +234,8 @@ PORT=${BIND#*:}
 DATA_DIR=/opt/dns-proxy/data
 DEFAULT_GIT_REPO=${GIT_REPO}
 DEFAULT_GIT_BRANCH=${GIT_BRANCH}
+# Internal token for protecting mutating APIs; UI and agents must use the same value
+INTERNAL_TOKEN=${DEFAULT_INTERNAL_TOKEN}
 EOF
   python3 -m venv /opt/dns-proxy/controller/venv
   /opt/dns-proxy/controller/venv/bin/pip install --upgrade pip
