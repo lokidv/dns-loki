@@ -7,7 +7,6 @@ services:
     network_mode: host
     volumes:
       - ./Corefile:/Corefile:ro
-      - ./bypass.zones:/etc/coredns/bypass.zones:ro
       - ./targets.override:/etc/coredns/targets.override:ro
       - ./v6block.override:/etc/coredns/v6block.override:ro
       - ./acl.override:/etc/coredns/acl.override:ro

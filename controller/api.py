@@ -238,7 +238,6 @@ class Node(BaseModel):
     ip: IPvAnyAddress
     role: str  # dns|proxy
     enabled: bool = True
-    fly_mode: Optional[bool] = None
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
     diag: Optional[dict] = None
@@ -247,7 +246,6 @@ class NodeIn(BaseModel):
     ip: Optional[IPvAnyAddress] = None
     role: str  # dns|proxy
     enabled: Optional[bool] = None
-    fly_mode: Optional[bool] = None
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
     diag: Optional[dict] = None
@@ -268,7 +266,6 @@ class ConfigOut(BaseModel):
     ui_auth_enabled: bool = False
     internal_auth_enabled: bool = False
     internal_auth_source: Optional[str] = "none"
-    fly_bypass_domains: List[str] = []
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -336,49 +333,8 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
-    st.setdefault("fly_bypass_domains", [])
-    # Backward-compat: ensure fly_mode key exists on all nodes
-    try:
-        if isinstance(st.get("nodes"), list):
-            for x in st["nodes"]:
-                if isinstance(x, dict) and "fly_mode" not in x:
-                    x["fly_mode"] = False
-    except Exception:
-        pass
     _save_state(st)
     return st
-
-@app.get("/v1/fly-bypass", response_model=List[str])
-def get_fly_bypass():
-    with LOCK:
-        st = _load_state()
-        return st.get("fly_bypass_domains", [])
-
-@app.post("/v1/fly-bypass/add", response_model=List[str], dependencies=[Depends(require_internal)])
-def add_fly_bypass(item: DomainItem):
-    dom = _normalize_domain(item.domain if item else "")
-    if not dom:
-        raise HTTPException(status_code=400, detail="invalid domain")
-    root = dom.lstrip("*.")
-    with LOCK:
-        st = _load_state()
-        lst = st.get("fly_bypass_domains", [])
-        if root not in lst:
-            lst.append(root)
-            st["fly_bypass_domains"] = lst
-        _save_state(st)
-        return st["fly_bypass_domains"]
-
-@app.delete("/v1/fly-bypass/{domain}", response_model=List[str], dependencies=[Depends(require_internal)])
-def delete_fly_bypass(domain: str):
-    d = _normalize_domain(domain)
-    d = d.lstrip("*.")
-    with LOCK:
-        st = _load_state()
-        lst = [x for x in st.get("fly_bypass_domains", []) if x != d]
-        st["fly_bypass_domains"] = lst
-        _save_state(st)
-        return st["fly_bypass_domains"]
 
 
 def _save_state(st):
@@ -617,7 +573,6 @@ def upsert_node(n: NodeIn, request: Request):
         n_payload = {
             "ip": ip_str,
             "role": n.role,
-            "fly_mode": n.fly_mode,
             "agents_version_applied": n.agents_version_applied,
             "ts": n.ts,
             "diag": n.diag,
@@ -628,7 +583,6 @@ def upsert_node(n: NodeIn, request: Request):
                 # Preserve existing values when incoming fields are None (avoid erasing)
                 old_diag = x.get("diag")
                 old_ver = x.get("agents_version_applied")
-                old_fly = x.get("fly_mode")
                 x.update(n_payload)
                 # Restore diag if missing in payload
                 if x.get("diag") is None and old_diag is not None:
@@ -649,13 +603,6 @@ def upsert_node(n: NodeIn, request: Request):
                     except Exception:
                         inc_i = old_i
                     x["agents_version_applied"] = max(old_i, inc_i)
-                # Preserve or coerce fly_mode
-                incoming_fly = n_payload.get("fly_mode")
-                if incoming_fly is None:
-                    if old_fly is not None:
-                        x["fly_mode"] = old_fly
-                else:
-                    x["fly_mode"] = bool(incoming_fly)
                 found = True
         if not found:
             # Defaults for new node records to avoid nulls in UI/state
@@ -668,9 +615,6 @@ def upsert_node(n: NodeIn, request: Request):
                 n_payload["enabled"] = True
             else:
                 n_payload["enabled"] = bool(n.enabled)
-            # Default fly_mode to False when not explicitly provided
-            if n_payload.get("fly_mode") is None:
-                n_payload["fly_mode"] = False
             st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]
@@ -694,28 +638,6 @@ def disable_node(ip: str):
         for x in st["nodes"]:
             if str(x["ip"]) == ip:
                 x["enabled"] = False
-        _save_state(st)
-        return st["nodes"]
-
-
-@app.post("/v1/nodes/{ip}/fly/enable", response_model=List[Node], dependencies=[Depends(require_internal)])
-def enable_fly_mode(ip: str):
-    with LOCK:
-        st = _load_state()
-        for x in st["nodes"]:
-            if str(x["ip"]) == ip:
-                x["fly_mode"] = True
-        _save_state(st)
-        return st["nodes"]
-
-
-@app.post("/v1/nodes/{ip}/fly/disable", response_model=List[Node], dependencies=[Depends(require_internal)])
-def disable_fly_mode(ip: str):
-    with LOCK:
-        st = _load_state()
-        for x in st["nodes"]:
-            if str(x["ip"]) == ip:
-                x["fly_mode"] = False
         _save_state(st)
         return st["nodes"]
 
@@ -1367,7 +1289,7 @@ def get_code_archive(repo: Optional[str] = None, branch: Optional[str] = None):
 # ===== DNS Query Telemetry (Agent → Controller) =====
 class TelemetryRowIn(BaseModel):
     domain: str
-    client_ip: IPvAnyAddress
+    client_ip: Optional[IPvAnyAddress] = None
     targeted: Optional[bool] = None
     count: int = 1
 
@@ -1467,7 +1389,7 @@ def ingest_dns_queries(payload: TelemetryPayloadIn):
                     "ts": base_ts,
                     "node_ip": node_ip_s,
                     "domain": _normalize_domain(r.domain),
-                    "client_ip": str(r.client_ip),
+                    "client_ip": (str(r.client_ip) if r.client_ip is not None else ""),
                     "targeted": (bool(r.targeted) if r.targeted is not None else None),
                     "count": int(r.count or 1),
                 }
@@ -1523,7 +1445,7 @@ def telemetry_top(since: Optional[float] = None, non_targeted: Optional[bool] = 
         for e in items:
             dom = _normalize_domain(e.get("domain", ""))
             cip = str(e.get("client_ip"))
-            if not dom or not cip:
+            if not dom:
                 continue
             if non_targeted and not (e.get("targeted") is False):
                 # only include explicitly non-targeted entries when requested
@@ -1533,10 +1455,11 @@ def telemetry_top(since: Optional[float] = None, non_targeted: Optional[bool] = 
             cnt = int(e.get("count", 1) or 1)
             ts_val = float(e.get("ts", 0))
             if not cur:
-                agg[key] = {"domain": dom, "total": cnt, "clients": {cip}, "first_seen": ts_val, "last_seen": ts_val}
+                agg[key] = {"domain": dom, "total": cnt, "clients": ({cip} if cip else set()), "first_seen": ts_val, "last_seen": ts_val}
             else:
                 cur["total"] += cnt
-                cur["clients"].add(cip)
+                if cip:
+                    cur["clients"].add(cip)
                 if ts_val < cur["first_seen"]:
                     cur["first_seen"] = ts_val
                 if ts_val > cur["last_seen"]:

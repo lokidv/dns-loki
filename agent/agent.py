@@ -424,16 +424,6 @@ def render_coredns_targets(domains, healthy_ips):
     lines.append("}")
     return "\n".join(lines) + "\n"
 
-def render_coredns_targets_catchall(healthy_ips):
-    """Return a CoreDNS template that matches ALL names and answers with selected proxy IPs."""
-    lines = ["template IN A {", "  match .*"]
-    ttl = 60
-    for ip in healthy_ips:
-        lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
-    lines.append("  fallthrough")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
-
 def _ensure_acl_symlink():
     """برای CoreDNS native مسیر import را تضمین می‌کند.
     برای سه فایل override (acl, targets, v6block) symlink می‌سازد تا Corefile بتواند import کند.
@@ -441,7 +431,7 @@ def _ensure_acl_symlink():
     """
     try:
         Path("/etc/coredns").mkdir(parents=True, exist_ok=True)
-        for name in ("acl.override", "targets.override", "v6block.override", "bypass.zones"):
+        for name in ("acl.override", "targets.override", "v6block.override"):
             src = Path(f"{DEF_CORE_DNS_DIR}/{name}")
             dst = Path(f"/etc/coredns/{name}")
             # Always replace destination with a symlink to src (ln -sf semantics)
@@ -466,32 +456,6 @@ def render_v6block(domains):
 }}
 """
 
-def render_v6block_catchall():
-    return """template IN AAAA {
-  match .*
-  rcode NOERROR
-}
-"""
-
-def render_coredns_bypass_zones(domains, upstreams=None):
-    """Render zone stanzas that bypass catch-all by forwarding matching zones upstream.
-    Each domain becomes its own server block so CoreDNS uses it instead of '.' block.
-    """
-    if not domains:
-        return "# no bypass zones\n"
-    ups = upstreams or ["1.1.1.1", "1.0.0.1"]
-    up_str = " ".join(ups)
-    lines = []
-    for d in sorted(set([str(x).lstrip("*.").strip().lower() for x in domains if str(x).strip()])):
-        if not d:
-            continue
-        lines.append(f"{d} {{")
-        lines.append("  cache 30")
-        lines.append(f"  forward . {up_str}")
-        lines.append("}")
-        lines.append("")
-    return "\n".join(lines)
-
 def render_coredns_acl(dns_clients, enforce: bool):
     """تولید فایل acl.override برای CoreDNS.
     اگر enforce=False باشد، فایل خالی/آزاد تولید می‌کنیم تا محدودیتی اعمال نشود.
@@ -509,13 +473,10 @@ def render_coredns_acl(dns_clients, enforce: bool):
 
 
 def reload_coredns():
-    # If running via Docker, reconcile compose (volumes) and try HUP
+    # If running via Docker, send HUP to PID 1 in the container
     try:
         res = run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml ps -q coredns", check=False)
-        if res.returncode == 0 and res.stdout is not None:
-            # Ensure service is up and pick up any compose/mount changes
-            run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml up -d coredns", check=False)
-            # Attempt fast reload; harmless if container restarted
+        if res.returncode == 0 and res.stdout and res.stdout.strip():
             run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml exec -T coredns kill -HUP 1", check=False)
             return
     except Exception:
@@ -525,26 +486,12 @@ def reload_coredns():
     run("systemctl restart coredns", check=False)
 
 
-def render_sniproxy_conf(domains, catch_all: bool = False):
+def render_sniproxy_conf(domains):
     table_lines = []
     for d in domains:
         d2 = d.lstrip("*.")
         table_lines.append(f"    {d2} *")
         table_lines.append(f"    .{d2} *")
-    if catch_all:
-        # Some sniproxy builds do NOT support regex patterns in table entries.
-        # To ensure broad matching, add common TLD suffix catch-alls which are
-        # supported (e.g., ".com *" matches any host ending with .com).
-        common_tlds = [
-            "com", "net", "org", "io", "co", "me", "ai", "app", "dev", "xyz",
-            "live", "site", "shop", "cloud", "tech", "pro", "info", "biz", "online",
-            "ir", "uk", "ru", "de", "fr", "it", "es", "nl", "se", "no", "dk",
-            "fi", "pl", "cz", "sk", "in", "tr", "ae", "qa", "sa"
-        ]
-        for tld in common_tlds:
-            table_lines.append(f"    .{tld} *")
-        # Additionally, try a regex catch-all for images that do support it.
-        table_lines.append("    .* *")
     template_path = Path(DEF_PROXY_DIR) / "sniproxy.conf.tmpl"
     base = template_path.read_text()
     table_block = "\n".join(table_lines)
@@ -1135,44 +1082,13 @@ def main():
                         best_lat, best_ip = lat, ip
             # Fallback: اگر سالمی نبود، همه را استفاده کن
             selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
-            # Determine Fly Mode state for THIS DNS node
-            my_fly = False
-            try:
-                nodes = conf.get("nodes", [])
-                if my_ip:
-                    for n in nodes:
-                        if str(n.get("ip")) == str(my_ip):
-                            my_fly = bool(n.get("fly_mode", False))
-                            break
-                # Fallback: single DNS node in config
-                if not my_ip and not my_fly:
-                    dns_nodes = [n for n in nodes if (n.get("role") == "dns")]
-                    if len(dns_nodes) == 1:
-                        my_fly = bool(dns_nodes[0].get("fly_mode", False))
-            except Exception:
-                my_fly = False
-            try:
-                log(f"dns: fly_mode={my_fly}")
-            except Exception:
-                pass
             # Render CoreDNS override files
-            if my_fly:
-                targets = render_coredns_targets_catchall(selected)
-                v6blk = render_v6block_catchall()
-            else:
-                targets = render_coredns_targets(domains, selected)
-                v6blk = render_v6block(domains)
+            targets = render_coredns_targets(domains, selected)
+            v6blk = render_v6block(domains)
             acltxt = render_coredns_acl(dns_clients, enforce_dns)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
             Path(f"{DEF_CORE_DNS_DIR}/acl.override").write_text(acltxt)
-            # Write bypass zones when Fly Mode is active (allow specific domains to resolve normally)
-            try:
-                bypass = conf.get("fly_bypass_domains", []) if my_fly else []
-                bz_txt = render_coredns_bypass_zones(bypass)
-                Path(f"{DEF_CORE_DNS_DIR}/bypass.zones").write_text(bz_txt)
-            except Exception as e:
-                log(f"dns: failed writing bypass.zones -> {e}")
             # Ensure native CoreDNS can import ACL file (no-op for container)
             _ensure_acl_symlink()
             # Reload CoreDNS
@@ -1209,20 +1125,7 @@ def main():
                 log("proxy: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_proxy_clients", [])
             # Render sniproxy.conf from template
-            # Enable catch-all routing when any DNS node is in Fly Mode
-            any_dns_fly = False
-            try:
-                for n in (conf.get("nodes", []) or []):
-                    if n.get("role") == "dns" and n.get("enabled", True) and bool(n.get("fly_mode", False)):
-                        any_dns_fly = True
-                        break
-            except Exception:
-                any_dns_fly = False
-            try:
-                log(f"proxy: any_dns_fly={any_dns_fly}")
-            except Exception:
-                pass
-            conf_txt = render_sniproxy_conf(domains, catch_all=any_dns_fly)
+            conf_txt = render_sniproxy_conf(domains)
             out_path = Path(DEF_PROXY_DIR) / "sniproxy.conf"
             old = out_path.read_text() if out_path.exists() else ""
             if conf_txt != old:
@@ -1255,6 +1158,24 @@ def main():
                 _write_last_ts(TELE_SNI_LAST_FILE, new_ts_sni)
             except Exception as e:
                 log(f"sni-telemetry: failed -> {e}")
+
+        # If this node is not marked as proxy but proxy enforcement is ON and sniproxy is present,
+        # still run SNI telemetry collection here to support combined-role deployments.
+        if role != "proxy" and enforce_proxy:
+            try:
+                if _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy"):
+                    last_ts_sni = _read_last_ts(TELE_SNI_LAST_FILE)
+                    sni_rows, new_ts_sni = _collect_sni_telemetry(domains, last_ts_sni)
+                    if sni_rows:
+                        payload = {"node_ip": my_ip, "ts": new_ts_sni, "rows": sni_rows}
+                        try:
+                            requests.post(f"{controller_url}/v1/telemetry/dns-queries", json=payload, timeout=5, headers=headers)
+                            log(f"sni-telemetry: sent {len(sni_rows)} rows (dns-role)")
+                        except Exception as e:
+                            log(f"sni-telemetry: post failed (dns-role) -> {e}")
+                    _write_last_ts(TELE_SNI_LAST_FILE, new_ts_sni)
+            except Exception as e:
+                log(f"sni-telemetry: failed (dns-role) -> {e}")
 
         # Build diagnostics after applying configs
         # Gather runtime nft set elements (best-effort)
