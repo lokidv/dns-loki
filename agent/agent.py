@@ -29,6 +29,9 @@ SNIFF_RING = collections.deque(maxlen=5000)  # (ts, client_ip, domain, qtype)
 SNIFF_LOCK = threading.Lock()
 SNIFF_THR = None
 SNIFF_RUNNING = False
+# Cache for mapping origin IPs (upstream servers) to last seen domain from sniproxy traffic.
+# key: origin IPv4 string -> value: (domain, ts)
+ORIGIP_LAST_DOMAIN = {}
 
 
 def _ensure_dns_sniffer_running():
@@ -100,6 +103,22 @@ def _sniff_rows_since(ts_from: float):
     except Exception:
         return []
     return rows
+
+
+def _last_dns_domain_for_client(cip: str, window_sec: float, now_ts: float):
+    """Return most recent DNS domain queried by client ip within window_sec, else None."""
+    if not cip:
+        return None
+    try:
+        with SNIFF_LOCK:
+            for (ts, c, dom, qt) in reversed(list(SNIFF_RING)):
+                if now_ts - ts > window_sec:
+                    break
+                if c == cip and dom:
+                    return dom
+    except Exception:
+        return None
+    return None
 
 
 def run(cmd, check=True):
@@ -374,12 +393,57 @@ def _collect_sni_telemetry(domains_rules, last_ts: float):
         lines = []
     # Parse
     pairs = []  # (client_ip, domain)
+    # Precompile summary regex: "CIP:port -> PROXY:port -> ORIG:port [domain] ..."
+    re_summary = re.compile(r"(?P<cip>\d+\.\d+\.\d+\.\d+):\d+\s*->\s*\d+\.\d+\.\d+\.\d+:\d+\s*->\s*(?P<orig>(?:\d+\.\d+\.\d+\.\d+|NONE))(?::\d+)?\s*\[(?P<dom>[^\]]*)\]", re.I)
+    now_ts = time.time()
     for ln in lines:
-        cip, host = _parse_sniproxy_access_log_line(ln)
+        s = (ln or "").strip()
+        if not s:
+            continue
+        # Skip sniproxy config parsing and resolver noise
+        if s.startswith("Parsed ") or s.startswith("resolv:"):
+            continue
+        # Try detailed summary pattern first (most reliable)
+        ms = re_summary.search(s)
+        if ms:
+            cip = ms.group("cip")
+            orig = ms.group("orig")
+            dom = (ms.group("dom") or "").strip().strip('.').lower()
+            if dom:
+                # Update origin->domain cache and record pair
+                if orig and orig.upper() != "NONE" and re.match(r"^\d+\.\d+\.\d+\.\d+$", orig):
+                    ORIGIP_LAST_DOMAIN[orig] = (dom, now_ts)
+                if not dom.endswith('.arpa'):
+                    pairs.append((cip or '', dom))
+                continue
+            # No domain in summary -> try to infer
+            inferred = None
+            if orig and orig.upper() != "NONE" and re.match(r"^\d+\.\d+\.\d+\.\d+$", orig):
+                t = ORIGIP_LAST_DOMAIN.get(orig)
+                if t and (now_ts - t[1] <= 600):
+                    inferred = t[0]
+            if not inferred:
+                inferred = _last_dns_domain_for_client(cip, window_sec=5.0, now_ts=now_ts)
+            if inferred and not inferred.endswith('.arpa'):
+                pairs.append((cip or '', inferred))
+            continue
+        # Handle lines indicating no SNI/TLS; try to infer by client IP from recent DNS queries
+        if (
+            "did not include a hostname" in s
+            or "did not begin with TLS handshake" in s
+            or "Unable to parse request" in s
+        ):
+            mcip = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", s)
+            cip = mcip.group(1) if mcip else None
+            inferred = _last_dns_domain_for_client(cip, window_sec=5.0, now_ts=now_ts)
+            if inferred and not inferred.endswith('.arpa'):
+                pairs.append((cip or '', inferred))
+            continue
+        # Fallback: generic parser (handles bracketed [domain] too)
+        cip, host = _parse_sniproxy_access_log_line(s)
         if not host:
             continue
         d = host.lower().strip('.')
-        # skip reverse/infrastructure noise
         if d.endswith('.arpa'):
             continue
         pairs.append((cip or '', d))

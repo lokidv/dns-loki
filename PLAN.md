@@ -24,6 +24,9 @@ A concise, actionable plan showing current status, exactly what to do now, and t
 ### همین الان دقیقاً چه کار کنیم (۳۰–۶۰ دقیقه آینده)
 1) نصب Proxy روی هر ۳ سرور آمریکا (روی هر سرور جداگانه اجرا شود؛ `<CONTROLLER_IP>` را با IP کنترلر جایگزین کنید)
 ```bash
+for restart proxy
+docker compose -f /opt/dns-proxy/docker/proxy/docker-compose.yml restart sniproxy
+
 apt-get update -y && apt-get install -y git
 git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
