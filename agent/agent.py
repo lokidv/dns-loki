@@ -543,15 +543,19 @@ def _parse_coredns_log_line(line: str):
             cip = m6.group(1)
         # extract quoted query section
         m_q = re.search(r'"([^"]+)"', txt)
-        if not m_q:
-            return cip, None, None
-        q = m_q.group(1)
-        parts = q.split()
-        if len(parts) < 3:
-            return cip, None, None
-        qtype = parts[0]
-        domain = parts[2].rstrip('.')
-        return cip, domain.lower(), qtype
+        if m_q:
+            q = m_q.group(1)
+            parts = q.split()
+            if len(parts) >= 3:
+                qtype = parts[0]
+                domain = parts[2].rstrip('.')
+                return cip, domain.lower(), qtype
+        # Fallbacks when format varies: try to locate a likely domain token
+        m_dom = re.search(r'\s([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)\.?\s', txt)
+        if m_dom:
+            dom = m_dom.group(1).rstrip('.')
+            return cip, dom.lower(), None
+        return cip, None, None
     except Exception:
         return None, None, None
 
@@ -579,17 +583,52 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
     now_ts = time.time()
     iso = _iso8601(last_ts)
     lines = []
-    # try docker logs first (container name is 'coredns')
+    # try docker logs first (resolve actual container id/name used by compose)
     try:
-        res = run(f"docker logs --since '{iso}' coredns", check=False)
-        if res.returncode == 0 and res.stdout:
+        cid = None
+        # Preferred: docker compose ps -q coredns
+        try:
+            resid = run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml ps -q coredns", check=False)
+            if resid.returncode == 0 and resid.stdout and resid.stdout.strip():
+                cid = resid.stdout.decode(errors='ignore').strip() if isinstance(resid.stdout, (bytes, bytearray)) else str(resid.stdout).strip()
+        except Exception:
+            cid = None
+        # Fallback: find any running container with name containing 'coredns'
+        if not cid:
             try:
-                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+                resls = run("docker ps --format '{{.ID}} {{.Names}}'", check=False)
+                if resls.returncode == 0 and resls.stdout:
+                    txt = resls.stdout.decode(errors='ignore') if isinstance(resls.stdout, (bytes, bytearray)) else str(resls.stdout)
+                    for line in txt.splitlines():
+                        parts = line.split(None, 1)
+                        if len(parts) == 2:
+                            _id, _name = parts[0].strip(), parts[1].strip()
+                            if 'coredns' in _name.lower():
+                                cid = _id
+                                break
             except Exception:
-                txt = str(res.stdout)
-            cand = [l for l in txt.splitlines() if l.strip()]
-            if cand:
-                lines = cand
+                cid = None
+        if cid:
+            res = run(f"docker logs --since '{iso}' {cid}", check=False)
+            if res.returncode == 0 and res.stdout:
+                try:
+                    txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+                except Exception:
+                    txt = str(res.stdout)
+                cand = [l for l in txt.splitlines() if l.strip()]
+                if cand:
+                    lines = cand
+        else:
+            # As a last try, attempt the bare name 'coredns'
+            res = run(f"docker logs --since '{iso}' coredns", check=False)
+            if res.returncode == 0 and res.stdout:
+                try:
+                    txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+                except Exception:
+                    txt = str(res.stdout)
+                cand = [l for l in txt.splitlines() if l.strip()]
+                if cand:
+                    lines = cand
     except Exception:
         lines = []
     # fallback: read from journald when running native CoreDNS services
@@ -609,7 +648,6 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
             except Exception:
                 continue
     rows = []
-    allowed_qtypes = {"A", "AAAA", "HTTPS", "SVCB", "SRV", "CNAME"}
     for ln in lines:
         cip, dom, qtype = _parse_coredns_log_line(ln)
         if not cip or not dom:
@@ -618,9 +656,7 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
         dlow = (dom or "").lower()
         if dlow.endswith(".arpa"):
             continue
-        # Keep modern discovery types so attempts surface even if A/AAAA aren't queried yet
-        if qtype and qtype.upper() not in allowed_qtypes:
-            continue
+        # Keep all other types (we want to see attempts regardless of success/type)
         rows.append((cip, dlow, (qtype or "").upper()))
     # aggregate by (domain, client_ip)
     agg = {}
