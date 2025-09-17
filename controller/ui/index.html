@@ -75,6 +75,7 @@
     /* Viewport-height panels for History */
     .vh-card{ display:flex; flex-direction:column; height: calc(100vh - 360px); }
     .vh-card .vh-scroll{ flex:1; overflow:auto; min-height:0; }
+    .vh-card .section-head{ position: sticky; top: 0; z-index: 4; background: var(--surface); }
   </style>
 </head>
 <body>
@@ -85,7 +86,7 @@
   </h1>
   <div class="tabs">
     <button id="tabHome" class="tab active">خانه</button>
-    <button id="tabHistory" class="tab">سابقه دامنه‌ها</button>
+    <button id="tabHistory" class="tab">سابقه دامنه‌ها <span id="badgeHistory" class="pill" style="display:none;"></span></button>
   </div>
   <div id="viewHome">
   <div class="row">
@@ -273,8 +274,9 @@
   <!-- Telemetry Settings on top -->
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
-      <h2>تنظیمات تله‌متری</h2>
-      <div class="kv">
+      <details id="teleSettings" open>
+        <summary><h2 style="display:inline;">تنظیمات تله‌متری</h2></summary>
+      <div class="kv" style="margin-top:8px;">
         <b>Retention (ثانیه)</b><div><input id="teleRetentionSec" type="number" min="60" step="60" placeholder="7200" style="width:160px;" /></div>
         <b>سقف رکوردها</b><div><input id="teleMaxEntries" type="number" min="1000" step="1000" placeholder="20000" style="width:160px;" /></div>
         <b>پاک‌سازی خودکار</b><div><label><input id="teleAutoEnabled" type="checkbox" /> فعال</label></div>
@@ -287,6 +289,7 @@
         <button id="btnTeleClear" style="background-color:#e74c3c; color:white;">پاک‌سازی اکنون</button>
       </div>
       <div class="muted" style="margin-top:6px;">Retention و سقف ورودی‌ها از رشد بیش از حد فایل state جلوگیری می‌کند. با فعال‌سازی پاک‌سازی خودکار، لاگ‌ها دوره‌ای صفر می‌شوند.</div>
+      </details>
     </div>
   </div>
   <!-- Two full-height panels side-by-side -->
@@ -301,10 +304,19 @@
           <label class="muted" style="display:flex; align-items:center; gap:6px;">
             <input type="checkbox" id="teleOnlyNonTargeted" /> فقط غیرهدف‌دار (عبور مستقیم)
           </label>
-          <button id="btnTeleRefresh">رفرش</button>
+          <div class="input-inline" style="gap:6px;">
+            <button id="btnTeleRefresh">رفرش</button>
+            <button id="btnTeleExportCsv">Export CSV</button>
+            <button class="btnTelePreset" data-mins="15">15m</button>
+            <button class="btnTelePreset" data-mins="60">60m</button>
+            <button class="btnTelePreset" data-mins="1440">24h</button>
+          </div>
         </div>
       </div>
-      <div id="teleCount" class="muted" style="margin-bottom:8px;">—</div>
+      <div class="muted" style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+        <div id="teleCount">—</div>
+        <div id="teleLoading" style="display:none;">در حال بارگذاری...</div>
+      </div>
       <div class="vh-scroll">
         <table class="table-sticky">
           <thead>
@@ -329,8 +341,17 @@
           <label class="muted" style="display:flex; align-items:center; gap:6px;"><input id="recOnlyNon" type="checkbox" /> فقط غیرهدف‌دار</label>
           <input id="recClient" placeholder="فیلتر IP کلاینت" style="width:160px;" />
           <input id="recDomain" placeholder="جستجوی دامنه" style="width:200px;" />
-          <button id="btnRecRefresh">رفرش</button>
+          <div class="input-inline" style="gap:6px;">
+            <button id="btnRecRefresh">رفرش</button>
+            <button id="btnRecExportCsv">Export CSV</button>
+            <button class="btnRecPreset" data-mins="15">15m</button>
+            <button class="btnRecPreset" data-mins="60">60m</button>
+            <button class="btnRecPreset" data-mins="1440">24h</button>
+          </div>
         </div>
+      </div>
+      <div class="muted" style="margin-bottom:8px; display:flex; justify-content:flex-end; align-items:center;">
+        <div id="recLoading" style="display:none;">در حال بارگذاری...</div>
       </div>
       <div class="vh-scroll">
         <table class="table-sticky">
@@ -393,8 +414,39 @@ async function loadTelemetrySettings(){
   }catch(_){ /* ignore */ }
 }
 
+// Render recents from cached items (no fetch)
+function renderRecentsFromCache(){
+  const fCli = (document.getElementById('recClient')?.value || '').trim();
+  const fDom = (document.getElementById('recDomain')?.value || '').trim().toLowerCase();
+  const body = document.getElementById('recBody'); if(!body) return;
+  body.innerHTML = '';
+  (APP.recItems || []).filter(e => {
+    if(fCli && String(e.client_ip) !== fCli) return false;
+    if(fDom && !String(e.domain||'').toLowerCase().includes(fDom)) return false;
+    return true;
+  }).forEach(e => {
+    const targeted = (e.targeted===true) ? '<span class="status ok">هدف‌دار</span>' : (e.targeted===false ? '<span class="status warn">غیرهدف‌دار</span>' : '—');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td title="${fmtTime(e.ts)}">${fmtAgo(e.ts||0)}</td>
+      <td class="cell-ip"><code>${e.client_ip||''}</code></td>
+      <td><code>${e.domain||''}</code></td>
+      <td>${targeted}</td>
+      <td>${e.count||1}</td>
+      <td>
+        <div class="input-inline" style="gap:6px;">
+          <button class="btnRecPromote" data-d="${e.domain}">افزودن دامنه</button>
+          <button class="btnRecPromoteSuffix" data-d="${e.domain}">افزودن ریشه</button>
+        </div>
+      </td>
+    `;
+    body.appendChild(tr);
+  });
+}
+
 async function loadTelemetryTop(){
   try{
+    const loading = document.getElementById('teleLoading'); if(loading) loading.style.display = 'inline';
     const mins = parseInt(document.getElementById('teleSinceMins')?.value || '60', 10) || 60;
     const since = Math.floor(Date.now()/1000) - (mins * 60);
     const onlyNon = !!document.getElementById('teleOnlyNonTargeted')?.checked;
@@ -403,12 +455,14 @@ async function loadTelemetryTop(){
     if(!r.ok){
       const t = await r.text();
       document.getElementById('teleCount').textContent = 'خطا در دریافت تله‌متری: ' + (t||r.status);
+      if(loading) loading.style.display = 'none';
       return;
     }
     const j = await r.json();
+    APP.teleTopItems = Array.isArray(j.items) ? j.items : [];
     const body = document.getElementById('teleTopBody');
     body.innerHTML = '';
-    (j.items || []).forEach(row => {
+    (APP.teleTopItems).forEach(row => {
       const tr = document.createElement('tr');
       const targeted = row.targeted_current ? '<span class="status ok">هدف‌دار</span>' : '<span class="status warn">غیرهدف‌دار</span>';
       const fs = row.first_seen ? fmtAgo(row.first_seen) : '—';
@@ -433,8 +487,9 @@ async function loadTelemetryTop(){
     const cnt = document.getElementById('teleCount');
     if(cnt){
       const onlyNonNote = (document.getElementById('teleOnlyNonTargeted')?.checked ? ' (فقط غیرهدف‌دار)' : '');
-      cnt.textContent = `تعداد: ${(j.items||[]).length}${onlyNonNote}`;
+      cnt.textContent = `تعداد: ${(APP.teleTopItems||[]).length}${onlyNonNote}`;
     }
+    updateHistoryBadge();
     // wire promote buttons
     body.querySelectorAll('.btnPromote').forEach(btn => {
       btn.onclick = async () => {
@@ -466,24 +521,28 @@ async function loadTelemetryTop(){
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
     });
+    if(loading) loading.style.display = 'none';
   }catch(e){
     document.getElementById('teleCount').textContent = 'خطا در تله‌متری: ' + (e?.message || e);
+    const loading = document.getElementById('teleLoading'); if(loading) loading.style.display = 'none';
   }
 }
 
 async function loadTelemetryRecents(){
   try{
+    const loading = document.getElementById('recLoading'); if(loading) loading.style.display = 'inline';
     const mins = parseInt(document.getElementById('recSinceMins')?.value || '60', 10) || 60;
     const since = Math.floor(Date.now()/1000) - (mins * 60);
     const onlyNon = !!document.getElementById('recOnlyNon')?.checked;
     const r = await api(`/v1/telemetry/dns-queries?since=${encodeURIComponent(since)}&non_targeted=${onlyNon?'true':'false'}&limit=1000`);
     if(!r.ok) return;
     const j = await r.json();
+    APP.recItems = Array.isArray(j.items) ? j.items : [];
     const fCli = (document.getElementById('recClient')?.value || '').trim();
     const fDom = (document.getElementById('recDomain')?.value || '').trim().toLowerCase();
     const body = document.getElementById('recBody');
     body.innerHTML = '';
-    (j.items || []).filter(e => {
+    (APP.recItems || []).filter(e => {
       if(fCli && String(e.client_ip) !== fCli) return false;
       if(fDom && !String(e.domain||'').toLowerCase().includes(fDom)) return false;
       return true;
@@ -531,6 +590,7 @@ async function loadTelemetryRecents(){
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
     });
+    if(loading) loading.style.display = 'none';
   }catch(_){ /* ignore */ }
 }
 
@@ -541,6 +601,63 @@ document.getElementById('btnTeleRefresh')?.addEventListener('click', async () =>
 document.getElementById('btnRecRefresh')?.addEventListener('click', async () => {
   await loadTelemetryRecents();
 });
+// History presets & CSV
+document.getElementById('btnTeleExportCsv')?.addEventListener('click', () => {
+  const items = Array.isArray(APP.teleTopItems) ? APP.teleTopItems : [];
+  const headers = ['domain','total','unique_clients','targeted_current','first_seen','last_seen'];
+  const rows = items.map(r => ({
+    domain: r.domain,
+    total: r.total,
+    unique_clients: r.unique_clients,
+    targeted_current: r.targeted_current,
+    first_seen: r.first_seen,
+    last_seen: r.last_seen,
+  }));
+  exportToCsv('telemetry_top.csv', headers, rows);
+});
+document.getElementById('btnRecExportCsv')?.addEventListener('click', () => {
+  const fCli = (document.getElementById('recClient')?.value || '').trim();
+  const fDom = (document.getElementById('recDomain')?.value || '').trim().toLowerCase();
+  const items = (APP.recItems || []).filter(e => {
+    if(fCli && String(e.client_ip) !== fCli) return false;
+    if(fDom && !String(e.domain||'').toLowerCase().includes(fDom)) return false;
+    return true;
+  });
+  const headers = ['ts','time_local','client_ip','domain','targeted','count'];
+  const rows = items.map(e => ({
+    ts: e.ts,
+    time_local: fmtTime(e.ts||0),
+    client_ip: e.client_ip||'',
+    domain: e.domain||'',
+    targeted: (e.targeted===true? 'true' : (e.targeted===false? 'false' : '')),
+    count: e.count||1,
+  }));
+  exportToCsv('dns_recents.csv', headers, rows);
+});
+document.querySelectorAll('.btnTelePreset')?.forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const mins = parseInt(btn.getAttribute('data-mins')||'60', 10) || 60;
+    const inp = document.getElementById('teleSinceMins'); if(inp) inp.value = mins;
+    saveHistoryFilters();
+    await loadTelemetryTop();
+  });
+});
+document.querySelectorAll('.btnRecPreset')?.forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const mins = parseInt(btn.getAttribute('data-mins')||'60', 10) || 60;
+    const inp = document.getElementById('recSinceMins'); if(inp) inp.value = mins;
+    saveHistoryFilters();
+    await loadTelemetryRecents();
+  });
+});
+// Persist filters on changes
+document.getElementById('teleSinceMins')?.addEventListener('change', async ()=>{ saveHistoryFilters(); await loadTelemetryTop(); });
+document.getElementById('teleOnlyNonTargeted')?.addEventListener('change', async ()=>{ saveHistoryFilters(); await loadTelemetryTop(); });
+document.getElementById('recSinceMins')?.addEventListener('change', async ()=>{ saveHistoryFilters(); await loadTelemetryRecents(); });
+document.getElementById('recOnlyNon')?.addEventListener('change', async ()=>{ saveHistoryFilters(); await loadTelemetryRecents(); });
+document.getElementById('recClient')?.addEventListener('input', ()=>{ saveHistoryFilters(); renderRecentsFromCache(); });
+document.getElementById('recDomain')?.addEventListener('input', ()=>{ saveHistoryFilters(); renderRecentsFromCache(); });
+document.getElementById('teleSettings')?.addEventListener('toggle', saveHistoryFilters);
 document.getElementById('btnTeleSaveSettings')?.addEventListener('click', async () => {
   const payload = {};
   const g = id => document.getElementById(id);
@@ -566,7 +683,63 @@ document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
     alert('پاک شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
-let APP = { cfg: null, refreshTimer: null, domainsAll: [], clientsAll: [], activeView: 'home' };
+let APP = { cfg: null, refreshTimer: null, domainsAll: [], clientsAll: [], teleTopItems: [], recItems: [], activeView: 'home' };
+
+// Helpers: badge, CSV, filters persistence
+function updateHistoryBadge(){
+  const b = document.getElementById('badgeHistory');
+  if(!b) return;
+  const n = Array.isArray(APP.teleTopItems) ? APP.teleTopItems.length : 0;
+  if(n > 0){ b.textContent = String(n); b.style.display = 'inline-flex'; }
+  else { b.textContent = ''; b.style.display = 'none'; }
+}
+
+function csvEscape(v){
+  const s = (v==null) ? '' : String(v);
+  if(/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function exportToCsv(filename, headers, rows){
+  try{
+    const head = headers.map(csvEscape).join(',');
+    const body = rows.map(r => headers.map(h => csvEscape(r[h])).join(',')).join('\n');
+    const csv = head + '\n' + body;
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+  }catch(e){ alert('خطا در ساخت CSV: ' + (e?.message || e)); }
+}
+
+function saveHistoryFilters(){
+  const st = {};
+  try{
+    st.teleSinceMins = parseInt(document.getElementById('teleSinceMins')?.value || '') || 60;
+    st.teleOnlyNonTargeted = !!document.getElementById('teleOnlyNonTargeted')?.checked;
+    st.recSinceMins = parseInt(document.getElementById('recSinceMins')?.value || '') || 60;
+    st.recOnlyNon = !!document.getElementById('recOnlyNon')?.checked;
+    st.recClient = (document.getElementById('recClient')?.value || '').trim();
+    st.recDomain = (document.getElementById('recDomain')?.value || '').trim();
+    st.teleSettingsOpen = !!document.getElementById('teleSettings')?.open;
+    localStorage.setItem('HISTORY_FILTERS', JSON.stringify(st));
+  }catch(_){ /* ignore */ }
+}
+function loadHistoryFilters(){
+  try{
+    const raw = localStorage.getItem('HISTORY_FILTERS');
+    if(!raw) return;
+    const st = JSON.parse(raw);
+    const g = id => document.getElementById(id);
+    if(st.teleSinceMins && g('teleSinceMins')) g('teleSinceMins').value = st.teleSinceMins;
+    if(typeof st.teleOnlyNonTargeted === 'boolean' && g('teleOnlyNonTargeted')) g('teleOnlyNonTargeted').checked = st.teleOnlyNonTargeted;
+    if(st.recSinceMins && g('recSinceMins')) g('recSinceMins').value = st.recSinceMins;
+    if(typeof st.recOnlyNon === 'boolean' && g('recOnlyNon')) g('recOnlyNon').checked = st.recOnlyNon;
+    if(typeof st.recClient === 'string' && g('recClient')) g('recClient').value = st.recClient;
+    if(typeof st.recDomain === 'string' && g('recDomain')) g('recDomain').value = st.recDomain;
+    if(typeof st.teleSettingsOpen === 'boolean' && g('teleSettings')) g('teleSettings').open = st.teleSettingsOpen;
+  }catch(_){ /* ignore */ }
+}
 
 // View switching (tabs) without page reload
 function setActiveTab(){
@@ -598,6 +771,8 @@ async function refreshActive(){
 function switchView(v){
   APP.activeView = (v === 'history') ? 'history' : 'home';
   setActiveTab();
+  // Load saved filters when entering history
+  if(APP.activeView === 'history') loadHistoryFilters();
   // Lazy-load data for the active view
   refreshActive();
 }
