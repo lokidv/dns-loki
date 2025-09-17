@@ -67,6 +67,10 @@
     #domainsList th:first-child, #domainsList td:first-child{ width:70%; }
     #domainsList th:last-child, #domainsList td:last-child{ width:30%; }
     .table-sticky thead th{ position: sticky; top: 0; z-index: 2; }
+    /* Tabs */
+    .tabs{ display:flex; gap:8px; margin: 8px 0 16px 0; }
+    .tab{ background:var(--surface-2); color:var(--text); border:1px solid var(--border); border-radius:999px; padding:8px 14px; cursor:pointer; }
+    .tab.active{ background: linear-gradient(180deg, #6d86ff, #4864ff); border-color:#4864ff; color:#fff; }
   </style>
 </head>
 <body>
@@ -75,6 +79,11 @@
     <span>DNS+SNI Control UI</span>
     <span class="muted">— داشبورد مدیریت</span>
   </h1>
+  <div class="tabs">
+    <button id="tabHome" class="tab active">خانه</button>
+    <button id="tabHistory" class="tab">سابقه دامنه‌ها</button>
+  </div>
+  <div id="viewHome">
   <div class="row">
     <div class="card col-4">
       <h2>دامنه‌ها</h2>
@@ -251,7 +260,9 @@
       </details>
     </div>
   </div>
+  </div>
 
+  <div id="viewHistory" style="display:none;">
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
       <div class="section-head">
@@ -329,6 +340,7 @@
         </table>
       </div>
     </div>
+  </div>
   </div>
   
   <script>
@@ -424,6 +436,8 @@ async function loadTelemetryTop(){
           const r2 = await api('/v1/telemetry/promote', { method:'POST', body: JSON.stringify({ domain: dom }) });
           const t = await r2.text();
           if(!r2.ok){ alert('خطا در افزودن دامنه: ' + t); return; }
+          // Auto sync (bump version) so domain list updates
+          await api('/v1/domains/sync', { method:'POST' });
           await Promise.all([loadDomains(), loadConfig()]);
           await loadTelemetryTop();
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
@@ -437,6 +451,8 @@ async function loadTelemetryTop(){
           const r2 = await api('/v1/telemetry/promote-suffix', { method:'POST', body: JSON.stringify({ domain: dom }) });
           const t = await r2.text();
           if(!r2.ok){ alert('خطا در افزودن ریشه: ' + t); return; }
+          // Auto sync (bump version) so domain list updates
+          await api('/v1/domains/sync', { method:'POST' });
           await Promise.all([loadDomains(), loadConfig()]);
           await loadTelemetryTop();
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
@@ -488,6 +504,8 @@ async function loadTelemetryRecents(){
           const r2 = await api('/v1/telemetry/promote', { method:'POST', body: JSON.stringify({ domain: dom }) });
           const t = await r2.text();
           if(!r2.ok){ alert('خطا در افزودن دامنه: ' + t); return; }
+          // Auto sync
+          await api('/v1/domains/sync', { method:'POST' });
           await Promise.all([loadDomains(), loadConfig()]);
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
@@ -499,6 +517,8 @@ async function loadTelemetryRecents(){
           const r2 = await api('/v1/telemetry/promote-suffix', { method:'POST', body: JSON.stringify({ domain: dom }) });
           const t = await r2.text();
           if(!r2.ok){ alert('خطا در افزودن ریشه: ' + t); return; }
+          // Auto sync
+          await api('/v1/domains/sync', { method:'POST' });
           await Promise.all([loadDomains(), loadConfig()]);
         }catch(e){ alert('خطا: ' + (e?.message || e)); }
       };
@@ -538,7 +558,41 @@ document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
     alert('پاک شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
-let APP = { cfg: null, refreshTimer: null, domainsAll: [] };
+let APP = { cfg: null, refreshTimer: null, domainsAll: [], activeView: 'home' };
+
+// View switching (tabs) without page reload
+function setActiveTab(){
+  const tHome = document.getElementById('tabHome');
+  const tHist = document.getElementById('tabHistory');
+  if(tHome && tHist){
+    tHome.classList.toggle('active', APP.activeView === 'home');
+    tHist.classList.toggle('active', APP.activeView === 'history');
+  }
+  const vHome = document.getElementById('viewHome');
+  const vHist = document.getElementById('viewHistory');
+  if(vHome) vHome.style.display = (APP.activeView === 'home') ? '' : 'none';
+  if(vHist) vHist.style.display = (APP.activeView === 'history') ? '' : 'none';
+}
+
+async function refreshActive(){
+  if(APP.activeView === 'home'){
+    await Promise.all([
+      loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings(),
+    ]);
+    await loadServerTokenStatus();
+  } else {
+    await Promise.all([
+      loadTelemetrySettings(), loadTelemetryTop(), loadTelemetryRecents()
+    ]);
+  }
+}
+
+function switchView(v){
+  APP.activeView = (v === 'history') ? 'history' : 'home';
+  setActiveTab();
+  // Lazy-load data for the active view
+  refreshActive();
+}
 
 // moved from <style>: load UI settings from controller
 async function loadUiSettings(){
@@ -886,12 +940,13 @@ async function loadNodes(){
 }
 
 async function init(){
+  // initial load for home
   await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
-  await Promise.all([loadTelemetrySettings(), loadTelemetryTop(), loadTelemetryRecents()]);
   updateTokenUI();
 }
 
 init();
+setActiveTab();
 
 // UI settings handlers (moved out of api())
 document.getElementById('btnSaveUiPath')?.addEventListener('click', async () => {
@@ -1055,18 +1110,18 @@ syncBtn.onclick = async ()=>{
 };
 
 // manual refresh
-document.getElementById('btnRefresh').onclick = async ()=>{
-  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings()]);
-  await loadServerTokenStatus();
-};
+document.getElementById('btnRefresh').onclick = async ()=>{ await refreshActive(); };
+
+// Tabs click handlers
+document.getElementById('tabHome')?.addEventListener('click', ()=> switchView('home'));
+document.getElementById('tabHistory')?.addEventListener('click', ()=> switchView('history'));
 
 // auto refresh toggle
 document.getElementById('autoRefresh').addEventListener('change', (e)=>{
   if(e.target.checked){
     if(APP.refreshTimer) clearInterval(APP.refreshTimer);
     APP.refreshTimer = setInterval(async ()=>{
-      await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings()]);
-      await loadServerTokenStatus();
+      await refreshActive();
     }, 10000);
   } else {
     if(APP.refreshTimer) clearInterval(APP.refreshTimer);
