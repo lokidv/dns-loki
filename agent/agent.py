@@ -510,8 +510,18 @@ def render_sniproxy_conf(domains, catch_all: bool = False):
         table_lines.append(f"    {d2} *")
         table_lines.append(f"    .{d2} *")
     if catch_all:
-        # Add a permissive fallback to proxy any hostname using the same port.
-        # This enables discovery in Fly/Scan modes once traffic reaches the proxy.
+        # Some sniproxy builds do NOT support regex patterns in table entries.
+        # To ensure broad matching, add common TLD suffix catch-alls which are
+        # supported (e.g., ".com *" matches any host ending with .com).
+        common_tlds = [
+            "com", "net", "org", "io", "co", "me", "ai", "app", "dev", "xyz",
+            "live", "site", "shop", "cloud", "tech", "pro", "info", "biz", "online",
+            "ir", "uk", "ru", "de", "fr", "it", "es", "nl", "se", "no", "dk",
+            "fi", "pl", "cz", "sk", "in", "tr", "ae", "qa", "sa"
+        ]
+        for tld in common_tlds:
+            table_lines.append(f"    .{tld} *")
+        # Additionally, try a regex catch-all for images that do support it.
         table_lines.append("    .* *")
     template_path = Path(DEF_PROXY_DIR) / "sniproxy.conf.tmpl"
     base = template_path.read_text()
