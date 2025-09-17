@@ -424,6 +424,16 @@ def render_coredns_targets(domains, healthy_ips):
     lines.append("}")
     return "\n".join(lines) + "\n"
 
+def render_coredns_targets_catchall(healthy_ips):
+    """Return a CoreDNS template that matches ALL names and answers with selected proxy IPs."""
+    lines = ["template IN A {", "  match .*"]
+    ttl = 60
+    for ip in healthy_ips:
+        lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
+    lines.append("  fallthrough")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
 def _ensure_acl_symlink():
     """برای CoreDNS native مسیر import را تضمین می‌کند.
     برای سه فایل override (acl, targets, v6block) symlink می‌سازد تا Corefile بتواند import کند.
@@ -456,6 +466,13 @@ def render_v6block(domains):
 }}
 """
 
+def render_v6block_catchall():
+    return """template IN AAAA {
+  match .*
+  rcode NOERROR
+}
+"""
+
 def render_coredns_acl(dns_clients, enforce: bool):
     """تولید فایل acl.override برای CoreDNS.
     اگر enforce=False باشد، فایل خالی/آزاد تولید می‌کنیم تا محدودیتی اعمال نشود.
@@ -486,12 +503,16 @@ def reload_coredns():
     run("systemctl restart coredns", check=False)
 
 
-def render_sniproxy_conf(domains):
+def render_sniproxy_conf(domains, catch_all: bool = False):
     table_lines = []
     for d in domains:
         d2 = d.lstrip("*.")
         table_lines.append(f"    {d2} *")
         table_lines.append(f"    .{d2} *")
+    if catch_all:
+        # Add a permissive fallback to proxy any hostname using the same port.
+        # This enables discovery in Fly/Scan modes once traffic reaches the proxy.
+        table_lines.append("    .* *")
     template_path = Path(DEF_PROXY_DIR) / "sniproxy.conf.tmpl"
     base = template_path.read_text()
     table_block = "\n".join(table_lines)
@@ -1082,9 +1103,33 @@ def main():
                         best_lat, best_ip = lat, ip
             # Fallback: اگر سالمی نبود، همه را استفاده کن
             selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
+            # Determine Fly Mode state for THIS DNS node
+            my_fly = False
+            try:
+                nodes = conf.get("nodes", [])
+                if my_ip:
+                    for n in nodes:
+                        if str(n.get("ip")) == str(my_ip):
+                            my_fly = bool(n.get("fly_mode", False))
+                            break
+                # Fallback: single DNS node in config
+                if not my_ip and not my_fly:
+                    dns_nodes = [n for n in nodes if (n.get("role") == "dns")]
+                    if len(dns_nodes) == 1:
+                        my_fly = bool(dns_nodes[0].get("fly_mode", False))
+            except Exception:
+                my_fly = False
+            try:
+                log(f"dns: fly_mode={my_fly}")
+            except Exception:
+                pass
             # Render CoreDNS override files
-            targets = render_coredns_targets(domains, selected)
-            v6blk = render_v6block(domains)
+            if my_fly:
+                targets = render_coredns_targets_catchall(selected)
+                v6blk = render_v6block_catchall()
+            else:
+                targets = render_coredns_targets(domains, selected)
+                v6blk = render_v6block(domains)
             acltxt = render_coredns_acl(dns_clients, enforce_dns)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
@@ -1125,7 +1170,20 @@ def main():
                 log("proxy: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_proxy_clients", [])
             # Render sniproxy.conf from template
-            conf_txt = render_sniproxy_conf(domains)
+            # Enable catch-all routing when any DNS node is in Fly Mode
+            any_dns_fly = False
+            try:
+                for n in (conf.get("nodes", []) or []):
+                    if n.get("role") == "dns" and n.get("enabled", True) and bool(n.get("fly_mode", False)):
+                        any_dns_fly = True
+                        break
+            except Exception:
+                any_dns_fly = False
+            try:
+                log(f"proxy: any_dns_fly={any_dns_fly}")
+            except Exception:
+                pass
+            conf_txt = render_sniproxy_conf(domains, catch_all=any_dns_fly)
             out_path = Path(DEF_PROXY_DIR) / "sniproxy.conf"
             old = out_path.read_text() if out_path.exists() else ""
             if conf_txt != old:

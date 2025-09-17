@@ -238,6 +238,7 @@ class Node(BaseModel):
     ip: IPvAnyAddress
     role: str  # dns|proxy
     enabled: bool = True
+    fly_mode: Optional[bool] = None
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
     diag: Optional[dict] = None
@@ -246,6 +247,7 @@ class NodeIn(BaseModel):
     ip: Optional[IPvAnyAddress] = None
     role: str  # dns|proxy
     enabled: Optional[bool] = None
+    fly_mode: Optional[bool] = None
     agents_version_applied: Optional[int] = None
     ts: Optional[float] = None
     diag: Optional[dict] = None
@@ -333,6 +335,14 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
+    # Backward-compat: ensure fly_mode key exists on all nodes
+    try:
+        if isinstance(st.get("nodes"), list):
+            for x in st["nodes"]:
+                if isinstance(x, dict) and "fly_mode" not in x:
+                    x["fly_mode"] = False
+    except Exception:
+        pass
     _save_state(st)
     return st
 
@@ -573,6 +583,7 @@ def upsert_node(n: NodeIn, request: Request):
         n_payload = {
             "ip": ip_str,
             "role": n.role,
+            "fly_mode": n.fly_mode,
             "agents_version_applied": n.agents_version_applied,
             "ts": n.ts,
             "diag": n.diag,
@@ -583,6 +594,7 @@ def upsert_node(n: NodeIn, request: Request):
                 # Preserve existing values when incoming fields are None (avoid erasing)
                 old_diag = x.get("diag")
                 old_ver = x.get("agents_version_applied")
+                old_fly = x.get("fly_mode")
                 x.update(n_payload)
                 # Restore diag if missing in payload
                 if x.get("diag") is None and old_diag is not None:
@@ -603,6 +615,13 @@ def upsert_node(n: NodeIn, request: Request):
                     except Exception:
                         inc_i = old_i
                     x["agents_version_applied"] = max(old_i, inc_i)
+                # Preserve or coerce fly_mode
+                incoming_fly = n_payload.get("fly_mode")
+                if incoming_fly is None:
+                    if old_fly is not None:
+                        x["fly_mode"] = old_fly
+                else:
+                    x["fly_mode"] = bool(incoming_fly)
                 found = True
         if not found:
             # Defaults for new node records to avoid nulls in UI/state
@@ -615,6 +634,9 @@ def upsert_node(n: NodeIn, request: Request):
                 n_payload["enabled"] = True
             else:
                 n_payload["enabled"] = bool(n.enabled)
+            # Default fly_mode to False when not explicitly provided
+            if n_payload.get("fly_mode") is None:
+                n_payload["fly_mode"] = False
             st["nodes"].append(n_payload)
         _save_state(st)
         return st["nodes"]
@@ -638,6 +660,28 @@ def disable_node(ip: str):
         for x in st["nodes"]:
             if str(x["ip"]) == ip:
                 x["enabled"] = False
+        _save_state(st)
+        return st["nodes"]
+
+
+@app.post("/v1/nodes/{ip}/fly/enable", response_model=List[Node], dependencies=[Depends(require_internal)])
+def enable_fly_mode(ip: str):
+    with LOCK:
+        st = _load_state()
+        for x in st["nodes"]:
+            if str(x["ip"]) == ip:
+                x["fly_mode"] = True
+        _save_state(st)
+        return st["nodes"]
+
+
+@app.post("/v1/nodes/{ip}/fly/disable", response_model=List[Node], dependencies=[Depends(require_internal)])
+def disable_fly_mode(ip: str):
+    with LOCK:
+        st = _load_state()
+        for x in st["nodes"]:
+            if str(x["ip"]) == ip:
+                x["fly_mode"] = False
         _save_state(st)
         return st["nodes"]
 

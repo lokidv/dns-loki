@@ -981,6 +981,7 @@ async function loadNodes(){
         <div class="input-inline" style="gap:6px;">
           <button class="btn-details">جزئیات</button>
           <button class="btn-toggle">${n.enabled ? 'غیرفعال' : 'فعال'}</button>
+          ${n.role==='dns' ? `<button class="btn-fly">${n.fly_mode ? 'خاموش Fly' : 'روشن Fly'}</button>` : ''}
           <button class="btn-del" style="background-color:#e74c3c; color:white;">حذف</button>
         </div>
       </td>
@@ -1030,6 +1031,7 @@ async function loadNodes(){
             <b>Latencyها</b><div>${latmap || '—'}</div>
             <b>DNS enforce</b><div>${d.enforce_dns===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
             <b>Proxy enforce</b><div>${d.enforce_proxy===true ? '<span class="status ok">فعال</span>' : '<span class="status warn">غیرفعال</span>'}</div>
+            <b>Fly Mode</b><div>${(n.role==='dns') ? (n.fly_mode ? '<span class="status ok">روشن</span>' : '<span class="status warn">خاموش</span>') : '—'}</div>
             <b>DNS allowlist (config)</b><div>${dnsCfg || '—'} ${dnsCfgArr.length? `<span class='pill'>${dnsCfgArr.length}</span>`:''}</div>
             <b>DNS allowlist (nft)</b><div>${dnsNft || '—'} ${dnsNftArr.length? `<span class='pill'>${dnsNftArr.length}</span>`:''}</div>
             <b>Proxy allowlist (config)</b><div>${proxyCfg || '—'} ${proxyCfgArr.length? `<span class='pill'>${proxyCfgArr.length}</span>`:''}</div>
@@ -1076,6 +1078,17 @@ async function loadNodes(){
       if(!r.ok){ const t = await r.text(); alert('خطا در تغییر وضعیت نود: ' + t); return; }
       await loadNodes();
     };
+    // fly mode toggle
+    const btnFly = tr.querySelector('.btn-fly');
+    if(btnFly){
+      btnFly.onclick = async () => {
+        const ip = encodeURIComponent(n.ip);
+        const path = n.fly_mode ? `/v1/nodes/${ip}/fly/disable` : `/v1/nodes/${ip}/fly/enable`;
+        const r = await api(path, { method:'POST' });
+        if(!r.ok){ const t = await r.text(); alert('خطا در تغییر Fly Mode: ' + t); return; }
+        await loadNodes();
+      };
+    }
     // delete node
     tr.querySelector('.btn-del').onclick = async () => {
       if(!confirm('این نود حذف شود؟')) return;
