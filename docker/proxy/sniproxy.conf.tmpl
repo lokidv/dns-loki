@@ -8,11 +8,13 @@ resolver {
 # HTTP proxy section
 listener 0.0.0.0:80 {
   proto http
+  access_log /dev/stdout
 }
 
 # TLS SNI proxy section
 listener 0.0.0.0:443 {
   proto tls
+  access_log /dev/stdout
 }
 
 # Default table used by listeners above

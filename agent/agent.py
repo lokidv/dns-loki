@@ -22,6 +22,7 @@ DOMAINS_DIR = f"{WORK_DIR}/domains"
 LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
 LOG_FILE = f"{WORK_DIR}/agent/agent.log"
 TELE_LAST_FILE = f"{WORK_DIR}/agent/telemetry_last_ts"
+TELE_SNI_LAST_FILE = f"{WORK_DIR}/agent/telemetry_sni_last_ts"
 
 # Live DNS sniffer globals
 SNIFF_RING = collections.deque(maxlen=5000)  # (ts, client_ip, domain, qtype)
@@ -308,6 +309,98 @@ def fetch_domains_from_api(controller_url: str, headers=None):
         pass
     return []
 
+
+def _parse_sniproxy_access_log_line(line: str):
+    """Parse a sniproxy access_log stdout line and extract (client_ip, hostname).
+    Tries common patterns like "<client_ip>:<port> -> <host>[:port]" or mentions of SNI.
+    Returns (client_ip, domain) or (None, None).
+    """
+    try:
+        s = (line or "").strip()
+        if not s:
+            return None, None
+        # First, try pattern with explicit arrow
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?\s*->\s*([A-Za-z0-9.-]*[A-Za-z][A-Za-z0-9.-]*\.[A-Za-z]{2,})", s)
+        if m:
+            return m.group(1), m.group(2).strip('.')
+        # Try to extract SNI host token
+        m2 = re.search(r"SNI[^A-Za-z0-9.-]*([A-Za-z0-9.-]*[A-Za-z][A-Za-z0-9.-]*\.[A-Za-z]{2,})", s, re.I)
+        if m2:
+            # Try also to get a client IP earlier in the line
+            m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?", s)
+            return (m_ip.group(1) if m_ip else None), m2.group(1).strip('.')
+        # Fallback: pick first domain-looking token in line
+        m3 = re.search(r"\b([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\b", s)
+        if m3:
+            m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?", s)
+            return (m_ip.group(1) if m_ip else None), m3.group(1).strip('.')
+    except Exception:
+        pass
+    return None, None
+
+
+def _collect_sni_telemetry(domains_rules, last_ts: float):
+    """Collect SNI/HTTP Hostnames from sniproxy container logs since last_ts.
+    Returns (rows: list[dict], new_ts: float). Rows format compatible with DNS telemetry: {domain, client_ip, targeted, count}.
+    """
+    now_ts = time.time()
+    iso = _iso8601(last_ts)
+    lines = []
+    # Resolve sniproxy container id
+    try:
+        cid = None
+        try:
+            resid = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml ps -q sniproxy", check=False)
+            if resid.returncode == 0 and resid.stdout and resid.stdout.strip():
+                cid = resid.stdout.decode(errors='ignore').strip() if isinstance(resid.stdout, (bytes, bytearray)) else str(resid.stdout).strip()
+        except Exception:
+            cid = None
+        if not cid:
+            # Fallback: search by name
+            resls = run("docker ps --format '{{.ID}} {{.Names}}'", check=False)
+            if resls.returncode == 0 and resls.stdout:
+                txt = resls.stdout.decode(errors='ignore') if isinstance(resls.stdout, (bytes, bytearray)) else str(resls.stdout)
+                for l in txt.splitlines():
+                    parts = l.split(None, 1)
+                    if len(parts) == 2 and 'sniproxy' in parts[1].lower():
+                        cid = parts[0].strip()
+                        break
+        if cid:
+            res = run(f"docker logs --since '{iso}' {cid}", check=False)
+            if res.returncode == 0 and res.stdout:
+                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+                lines = [l for l in txt.splitlines() if l.strip()]
+    except Exception:
+        lines = []
+    # Parse
+    pairs = []  # (client_ip, domain)
+    for ln in lines:
+        cip, host = _parse_sniproxy_access_log_line(ln)
+        if not host:
+            continue
+        d = host.lower().strip('.')
+        # skip reverse/infrastructure noise
+        if d.endswith('.arpa'):
+            continue
+        pairs.append((cip or '', d))
+    # Aggregate counts by (domain, client_ip)
+    agg = {}
+    for (cip, dom) in pairs:
+        key = (dom, cip)
+        agg[key] = agg.get(key, 0) + 1
+    out_rows = []
+    for (dom, cip), cnt in agg.items():
+        out_rows.append({
+            "domain": dom,
+            "client_ip": cip,
+            "targeted": _domain_targeted(dom, domains_rules),
+            "count": int(cnt),
+        })
+    try:
+        log(f"sni-telemetry: parsed lines={len(lines)} unique_pairs={len(agg)}")
+    except Exception:
+        pass
+    return out_rows, now_ts
 
 def build_regex_from_domains(domains):
     # Convert list like ["amd.com", "*.amd.com"] into a regex alternation
@@ -1050,6 +1143,21 @@ def main():
                         restart_sniproxy()
                     else:
                         log("sniproxy: start skipped; docker not ready")
+
+            # Collect and send SNI telemetry from sniproxy logs (best-effort)
+            try:
+                last_ts_sni = _read_last_ts(TELE_SNI_LAST_FILE)
+                sni_rows, new_ts_sni = _collect_sni_telemetry(domains, last_ts_sni)
+                if sni_rows:
+                    payload = {"node_ip": my_ip, "ts": new_ts_sni, "rows": sni_rows}
+                    try:
+                        requests.post(f"{controller_url}/v1/telemetry/dns-queries", json=payload, timeout=5, headers=headers)
+                        log(f"sni-telemetry: sent {len(sni_rows)} rows")
+                    except Exception as e:
+                        log(f"sni-telemetry: post failed -> {e}")
+                _write_last_ts(TELE_SNI_LAST_FILE, new_ts_sni)
+            except Exception as e:
+                log(f"sni-telemetry: failed -> {e}")
 
         # Build diagnostics after applying configs
         # Gather runtime nft set elements (best-effort)
