@@ -532,11 +532,15 @@ def _parse_coredns_log_line(line: str):
         txt = line.strip()
         if not txt:
             return None, None, None
-        # extract client ip
+        # extract client ip (support IPv4:port and [IPv6]:port formats)
         m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", txt)
-        if not m_ip:
-            return None, None, None
-        cip = m_ip.group(1)
+        if m_ip:
+            cip = m_ip.group(1)
+        else:
+            m6 = re.search(r"\[([0-9a-fA-F:]+)\]:(\d+)", txt)
+            if not m6:
+                return None, None, None
+            cip = m6.group(1)
         # extract quoted query section
         m_q = re.search(r'"([^"]+)"', txt)
         if not m_q:
@@ -567,8 +571,10 @@ def _domain_targeted(domain: str, rules) -> bool:
 
 
 def _collect_dns_telemetry(domains_rules, last_ts: float):
-    """Collect CoreDNS logs since last_ts using docker logs; return rows list and new_ts.
+    """Collect CoreDNS logs since last_ts using docker/journald logs; return rows list and new_ts.
     rows: list of (client_ip, domain, qtype)
+    Capture DNS query attempts broadly (A/AAAA plus modern types like HTTPS/SVCB/SRV/CNAME)
+    to ensure blocked domains still show up even when upstream resolution fails.
     """
     now_ts = time.time()
     iso = _iso8601(last_ts)
@@ -603,18 +609,19 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
             except Exception:
                 continue
     rows = []
+    allowed_qtypes = {"A", "AAAA", "HTTPS", "SVCB", "SRV", "CNAME"}
     for ln in lines:
         cip, dom, qtype = _parse_coredns_log_line(ln)
         if not cip or not dom:
             continue
-        # Include broader qtypes so sanctioned domains (e.g., HTTPS/SVCB only) are not missed.
-        # We accept common types and also tolerate unknowns; filter only truly irrelevant noise later if needed.
-        # Common modern types: A, AAAA, HTTPS (type65), SVCB, CNAME
-        allow_types = {"A", "AAAA", "HTTPS", "SVCB", "CNAME"}
-        if qtype and qtype not in allow_types:
-            # Optionally skip PTR/others to reduce noise; adjust as needed
-            pass  # keep even uncommon types by not continuing
-        rows.append((cip, dom, qtype or ""))
+        # filter out PTR/reverse and infrastructure noise to avoid flooding
+        dlow = (dom or "").lower()
+        if dlow.endswith(".arpa"):
+            continue
+        # Keep modern discovery types so attempts surface even if A/AAAA aren't queried yet
+        if qtype and qtype.upper() not in allowed_qtypes:
+            continue
+        rows.append((cip, dlow, (qtype or "").upper()))
     # aggregate by (domain, client_ip)
     agg = {}
     for (cip, dom, _qt) in rows:
