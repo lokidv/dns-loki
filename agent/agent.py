@@ -473,6 +473,25 @@ def render_v6block_catchall():
 }
 """
 
+def render_coredns_bypass_zones(domains, upstreams=None):
+    """Render zone stanzas that bypass catch-all by forwarding matching zones upstream.
+    Each domain becomes its own server block so CoreDNS uses it instead of '.' block.
+    """
+    if not domains:
+        return "# no bypass zones\n"
+    ups = upstreams or ["1.1.1.1", "1.0.0.1"]
+    up_str = " ".join(ups)
+    lines = []
+    for d in sorted(set([str(x).lstrip("*.").strip().lower() for x in domains if str(x).strip()])):
+        if not d:
+            continue
+        lines.append(f"{d} {{")
+        lines.append("  cache 30")
+        lines.append(f"  forward . {up_str}")
+        lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
 def render_coredns_acl(dns_clients, enforce: bool):
     """تولید فایل acl.override برای CoreDNS.
     اگر enforce=False باشد، فایل خالی/آزاد تولید می‌کنیم تا محدودیتی اعمال نشود.
@@ -1144,6 +1163,13 @@ def main():
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
             Path(f"{DEF_CORE_DNS_DIR}/acl.override").write_text(acltxt)
+            # Write bypass zones when Fly Mode is active (allow specific domains to resolve normally)
+            try:
+                bypass = conf.get("fly_bypass_domains", []) if my_fly else []
+                bz_txt = render_coredns_bypass_zones(bypass)
+                Path(f"{DEF_CORE_DNS_DIR}/bypass.zones").write_text(bz_txt)
+            except Exception as e:
+                log(f"dns: failed writing bypass.zones -> {e}")
             # Ensure native CoreDNS can import ACL file (no-op for container)
             _ensure_acl_symlink()
             # Reload CoreDNS

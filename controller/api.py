@@ -268,6 +268,7 @@ class ConfigOut(BaseModel):
     ui_auth_enabled: bool = False
     internal_auth_enabled: bool = False
     internal_auth_source: Optional[str] = "none"
+    fly_bypass_domains: List[str] = []
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -335,6 +336,7 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
+    st.setdefault("fly_bypass_domains", [])
     # Backward-compat: ensure fly_mode key exists on all nodes
     try:
         if isinstance(st.get("nodes"), list):
@@ -345,6 +347,38 @@ def _load_state():
         pass
     _save_state(st)
     return st
+
+@app.get("/v1/fly-bypass", response_model=List[str])
+def get_fly_bypass():
+    with LOCK:
+        st = _load_state()
+        return st.get("fly_bypass_domains", [])
+
+@app.post("/v1/fly-bypass/add", response_model=List[str], dependencies=[Depends(require_internal)])
+def add_fly_bypass(item: DomainItem):
+    dom = _normalize_domain(item.domain if item else "")
+    if not dom:
+        raise HTTPException(status_code=400, detail="invalid domain")
+    root = dom.lstrip("*.")
+    with LOCK:
+        st = _load_state()
+        lst = st.get("fly_bypass_domains", [])
+        if root not in lst:
+            lst.append(root)
+            st["fly_bypass_domains"] = lst
+        _save_state(st)
+        return st["fly_bypass_domains"]
+
+@app.delete("/v1/fly-bypass/{domain}", response_model=List[str], dependencies=[Depends(require_internal)])
+def delete_fly_bypass(domain: str):
+    d = _normalize_domain(domain)
+    d = d.lstrip("*.")
+    with LOCK:
+        st = _load_state()
+        lst = [x for x in st.get("fly_bypass_domains", []) if x != d]
+        st["fly_bypass_domains"] = lst
+        _save_state(st)
+        return st["fly_bypass_domains"]
 
 
 def _save_state(st):
