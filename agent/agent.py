@@ -607,9 +607,13 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
         cip, dom, qtype = _parse_coredns_log_line(ln)
         if not cip or not dom:
             continue
-        # Only consider A/AAAA to match our targeting model
-        if qtype and qtype not in ("A", "AAAA"):
-            continue
+        # Include broader qtypes so sanctioned domains (e.g., HTTPS/SVCB only) are not missed.
+        # We accept common types and also tolerate unknowns; filter only truly irrelevant noise later if needed.
+        # Common modern types: A, AAAA, HTTPS (type65), SVCB, CNAME
+        allow_types = {"A", "AAAA", "HTTPS", "SVCB", "CNAME"}
+        if qtype and qtype not in allow_types:
+            # Optionally skip PTR/others to reduce noise; adjust as needed
+            pass  # keep even uncommon types by not continuing
         rows.append((cip, dom, qtype or ""))
     # aggregate by (domain, client_ip)
     agg = {}
