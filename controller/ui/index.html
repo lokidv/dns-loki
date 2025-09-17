@@ -71,6 +71,9 @@
     .tabs{ display:flex; gap:8px; margin: 8px 0 16px 0; }
     .tab{ background:var(--surface-2); color:var(--text); border:1px solid var(--border); border-radius:999px; padding:8px 14px; cursor:pointer; }
     .tab.active{ background: linear-gradient(180deg, #6d86ff, #4864ff); border-color:#4864ff; color:#fff; }
+    /* Viewport-height panels for History */
+    .vh-card{ display:flex; flex-direction:column; height: calc(100vh - 360px); }
+    .vh-card .vh-scroll{ flex:1; overflow:auto; min-height:0; }
   </style>
 </head>
 <body>
@@ -210,6 +213,9 @@
         <label><input type="checkbox" id="clProxy" checked /> Proxy</label>
         <button id="btnAddClient" class="btn-primary">افزودن</button>
       </div>
+      <div class="input-inline" style="margin:8px 0;">
+        <input id="clientsSearch" placeholder="جستجوی IP یا یادداشت..." style="width:100%;" />
+      </div>
       <table class="table-sticky">
         <thead><tr><th>IP</th><th>Scope</th><th>یادداشت</th><th>عملیات</th></tr></thead>
         <tbody id="clients"></tbody>
@@ -263,40 +269,9 @@
   </div>
 
   <div id="viewHistory" style="display:none;">
+  <!-- Telemetry Settings on top -->
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
-      <div class="section-head">
-        <h2>تله‌متری DNS (دامنه‌های پرتکرار)</h2>
-        <div class="toolbar">
-          <label class="muted" style="display:flex; align-items:center; gap:6px;">
-            بازه (دقیقه): <input id="teleSinceMins" type="number" min="1" value="60" style="width:90px; margin-right:6px;" />
-          </label>
-          <label class="muted" style="display:flex; align-items:center; gap:6px;">
-            <input type="checkbox" id="teleOnlyNonTargeted" /> فقط غیرهدف‌دار (عبور مستقیم)
-          </label>
-          <button id="btnTeleRefresh">رفرش</button>
-        </div>
-      </div>
-      <div id="teleCount" class="muted" style="margin-bottom:8px;">—</div>
-      <div style="overflow:auto;">
-        <table class="table-sticky">
-          <thead>
-            <tr>
-              <th>دامنه</th>
-              <th>کل درخواست</th>
-              <th>کلاینت‌های یکتا</th>
-              <th>هدف‌دار؟</th>
-              <th>اولین/آخرین مشاهده</th>
-              <th>عملیات</th>
-            </tr>
-          </thead>
-          <tbody id="teleTopBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-  <div class="row" style="margin-top:16px;">
-    <div class="card col-4">
       <h2>تنظیمات تله‌متری</h2>
       <div class="kv">
         <b>Retention (ثانیه)</b><div><input id="teleRetentionSec" type="number" min="60" step="60" placeholder="7200" style="width:160px;" /></div>
@@ -312,8 +287,40 @@
       </div>
       <div class="muted" style="margin-top:6px;">Retention و سقف ورودی‌ها از رشد بیش از حد فایل state جلوگیری می‌کند. با فعال‌سازی پاک‌سازی خودکار، لاگ‌ها دوره‌ای صفر می‌شوند.</div>
     </div>
-
-    <div class="card col-8">
+  </div>
+  <!-- Two full-height panels side-by-side -->
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-6 vh-card">
+      <div class="section-head">
+        <h2>تله‌متری DNS (دامنه‌های پرتکرار)</h2>
+        <div class="toolbar">
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">
+            بازه (دقیقه): <input id="teleSinceMins" type="number" min="1" value="60" style="width:90px; margin-right:6px;" />
+          </label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="teleOnlyNonTargeted" /> فقط غیرهدف‌دار (عبور مستقیم)
+          </label>
+          <button id="btnTeleRefresh">رفرش</button>
+        </div>
+      </div>
+      <div id="teleCount" class="muted" style="margin-bottom:8px;">—</div>
+      <div class="vh-scroll">
+        <table class="table-sticky">
+          <thead>
+            <tr>
+              <th>دامنه</th>
+              <th>کل درخواست</th>
+              <th>کلاینت‌های یکتا</th>
+              <th>هدف‌دار؟</th>
+              <th>اولین/آخرین مشاهده</th>
+              <th>عملیات</th>
+            </tr>
+          </thead>
+          <tbody id="teleTopBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card col-6 vh-card">
       <div class="section-head">
         <h2>درخواست‌های اخیر (کلاینت/دامنه)</h2>
         <div class="toolbar">
@@ -324,7 +331,7 @@
           <button id="btnRecRefresh">رفرش</button>
         </div>
       </div>
-      <div style="overflow:auto;">
+      <div class="vh-scroll">
         <table class="table-sticky">
           <thead>
             <tr>
@@ -558,7 +565,7 @@ document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
     alert('پاک شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
-let APP = { cfg: null, refreshTimer: null, domainsAll: [], activeView: 'home' };
+let APP = { cfg: null, refreshTimer: null, domainsAll: [], clientsAll: [], activeView: 'home' };
 
 // View switching (tabs) without page reload
 function setActiveTab(){
@@ -700,12 +707,13 @@ async function loadDomains(){
   renderDomains();
 }
 
-async function loadClients(){
-  const r = await api('/v1/clients');
-  const arr = await r.json();
+function renderClients(){
   const el = document.getElementById('clients');
   el.innerHTML = '';
-  arr.forEach(c => {
+  const q = (document.getElementById('clientsSearch')?.value || '').trim().toLowerCase();
+  const src = Array.isArray(APP.clientsAll) ? APP.clientsAll : [];
+  const list = q ? src.filter(c => String(c.ip||'').toLowerCase().includes(q) || String(c.note||'').toLowerCase().includes(q)) : src;
+  list.forEach(c => {
     const tr = document.createElement('tr');
     const hasDns = Array.isArray(c.scope) && c.scope.includes('dns');
     const hasProxy = Array.isArray(c.scope) && c.scope.includes('proxy');
@@ -750,6 +758,12 @@ async function loadClients(){
     };
     el.appendChild(tr);
   });
+}
+
+async function loadClients(){
+  const r = await api('/v1/clients');
+  APP.clientsAll = await r.json();
+  renderClients();
 }
 
 async function loadNodes(){
@@ -1102,6 +1116,10 @@ if(domSearch){ domSearch.addEventListener('input', renderDomains); }
 
 // sync button
 const syncBtn = document.getElementById('syncBtn');
+
+// clients search handler
+const clSearch = document.getElementById('clientsSearch');
+if(clSearch){ clSearch.addEventListener('input', renderClients); }
 syncBtn.onclick = async ()=>{
   const r = await api('/v1/domains/sync', { method:'POST' });
   if(!r.ok){ const t = await r.text(); alert('خطا در سینک: ' + t); return; }
