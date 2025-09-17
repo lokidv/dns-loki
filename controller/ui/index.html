@@ -66,7 +66,8 @@
     #domainsList table{ table-layout: fixed; }
     #domainsList th:first-child, #domainsList td:first-child{ width:70%; }
     #domainsList th:last-child, #domainsList td:last-child{ width:30%; }
-    .table-sticky thead th{ position: sticky; top: 0; z-index: 2; }
+    .table-sticky thead th{ position: sticky; top: 0; z-index: 2; background: var(--surface); }
+    .table-sticky thead tr{ position: sticky; top: 0; z-index: 3; }
     /* Tabs */
     .tabs{ display:flex; gap:8px; margin: 8px 0 16px 0; }
     .tab{ background:var(--surface-2); color:var(--text); border:1px solid var(--border); border-radius:999px; padding:8px 14px; cursor:pointer; }
@@ -225,7 +226,7 @@
   </div>
 
   <div class="row" style="margin-top:16px;">
-    <div class="card col-12" style=" overflow:auto;">
+    <div class="card col-12">
       <h2>نودها</h2>
       <table class="table-sticky nodes-table">
         <thead>
@@ -290,7 +291,7 @@
   </div>
   <!-- Two full-height panels side-by-side -->
   <div class="row" style="margin-top:16px;">
-    <div class="card col-6 vh-card">
+    <div class="card col-12 vh-card">
       <div class="section-head">
         <h2>تله‌متری DNS (دامنه‌های پرتکرار)</h2>
         <div class="toolbar">
@@ -320,7 +321,7 @@
         </table>
       </div>
     </div>
-    <div class="card col-6 vh-card">
+    <div class="card col-12 vh-card">
       <div class="section-head">
         <h2>درخواست‌های اخیر (کلاینت/دامنه)</h2>
         <div class="toolbar">
