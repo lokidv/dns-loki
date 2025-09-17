@@ -581,10 +581,27 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
                 txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
             except Exception:
                 txt = str(res.stdout)
-            lines = [l for l in txt.splitlines() if l.strip()]
+            cand = [l for l in txt.splitlines() if l.strip()]
+            if cand:
+                lines = cand
     except Exception:
         lines = []
-    # future: optionally journalctl for native
+    # fallback: read from journald when running native CoreDNS services
+    if not lines:
+        for unit in ("coredns-native.service", "coredns-native", "coredns.service", "coredns"):
+            try:
+                resj = run(f"journalctl -u {unit} --since '{iso}' --no-pager", check=False)
+                if resj.returncode == 0 and resj.stdout:
+                    try:
+                        txt = resj.stdout.decode(errors='ignore') if isinstance(resj.stdout, (bytes, bytearray)) else str(resj.stdout)
+                    except Exception:
+                        txt = str(resj.stdout)
+                    cand = [l for l in txt.splitlines() if l.strip()]
+                    if cand:
+                        lines = cand
+                        break
+            except Exception:
+                continue
     rows = []
     for ln in lines:
         cip, dom, qtype = _parse_coredns_log_line(ln)

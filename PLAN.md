@@ -29,6 +29,16 @@ git clone https://github.com/lokidv/dns-loki.git && cd dns-loki
 sudo ./scripts/install.sh \
   --role proxy \
   --controller-url http://<CONTROLLER_IP>:8080
+
+or with custom branch
+apt-get update -y && apt-get install -y git
+git clone --branch withhistory --single-branch https://github.com/lokidv/dns-loki.git
+cd dns-loki
+cd scripts/
+chmod +x install.sh 
+sudo ./install.sh \
+  --role proxy \
+  --controller-url http://<CONTROLLER_IP>:8080
 ```
 سرورهای آمریکا که باید این دستور روی آن‌ها اجرا شود:
 - 144.172.98.5
