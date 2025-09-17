@@ -1269,3 +1269,366 @@ def get_code_archive(repo: Optional[str] = None, branch: Optional[str] = None):
 
     headers = {"Content-Disposition": f"attachment; filename=code-{br}.zip"}
     return StreamingResponse(_iter(), media_type="application/zip", headers=headers)
+
+
+# ===== DNS Query Telemetry (Agent → Controller) =====
+class TelemetryRowIn(BaseModel):
+    domain: str
+    client_ip: IPvAnyAddress
+    targeted: Optional[bool] = None
+    count: int = 1
+
+
+class TelemetryPayloadIn(BaseModel):
+    node_ip: Optional[IPvAnyAddress] = None
+    ts: Optional[float] = None
+    rows: List[TelemetryRowIn]
+
+
+def _ensure_telemetry_defaults(st: dict) -> dict:
+    st.setdefault("telemetry", {"entries": []})
+    if not isinstance(st["telemetry"].get("entries"), list):
+        st["telemetry"]["entries"] = []
+    return st
+
+
+def _purge_old_telemetry(st: dict, now_ts: Optional[float] = None, max_age_seconds: int = 7200, max_entries: int = 20000):
+    try:
+        tele = st.get("telemetry", {})
+        entries = tele.get("entries", [])
+        if not isinstance(entries, list) or not entries:
+            return
+        if now_ts is None:
+            now_ts = time.time()
+        cutoff = now_ts - max_age_seconds
+        # keep only recent entries
+        filtered = [e for e in entries if isinstance(e, dict) and float(e.get("ts", 0)) >= cutoff]
+        # cap total entries to avoid unbounded growth (drop oldest)
+        if len(filtered) > max_entries:
+            filtered = filtered[-max_entries:]
+        tele["entries"] = filtered
+        st["telemetry"] = tele
+    except Exception:
+        # never raise in purge
+        pass
+
+
+def _normalize_domain(name: str) -> str:
+    try:
+        s = (name or "").strip().lower()
+        if s.endswith('.'):
+            s = s[:-1]
+        return s
+    except Exception:
+        return ""
+
+
+def _domain_matches_rule(domain: str, rule: str) -> bool:
+    """Return True if domain is exactly rule or a subdomain of rule.
+    Rules are stored without leading '*.' (e.g., 'example.com').
+    """
+    d = _normalize_domain(domain)
+    r = _normalize_domain(rule)
+    if not d or not r:
+        return False
+    return d == r or d.endswith("." + r)
+
+
+def _is_domain_targeted_now(domain: str, rules: List[str]) -> bool:
+    for r in (rules or []):
+        if _domain_matches_rule(domain, r):
+            return True
+    return False
+
+
+def _guess_suffix(domain: str) -> str:
+    """Heuristic to guess the registrable suffix, defaulting to last two labels.
+    This is intentionally simple to avoid PSL dependency; admins can edit later if needed.
+    """
+    d = _normalize_domain(domain)
+    parts = [p for p in d.split('.') if p]
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:])
+    return d
+
+
+@app.post("/v1/telemetry/dns-queries", dependencies=[Depends(require_internal)])
+def ingest_dns_queries(payload: TelemetryPayloadIn):
+    """Receive aggregated DNS query counts from agents.
+    Stores recent entries in controller state with a time-based retention and size cap.
+    """
+    if not payload or not payload.rows:
+        return {"ok": True, "received": 0}
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        now_ts = time.time()
+        _maybe_auto_clear_telemetry(st, now_ts)
+        base_ts = float(payload.ts) if (payload.ts is not None) else now_ts
+        node_ip_s = str(payload.node_ip) if payload.node_ip is not None else None
+        buf = st["telemetry"]["entries"]
+        for r in payload.rows:
+            try:
+                entry = {
+                    "ts": base_ts,
+                    "node_ip": node_ip_s,
+                    "domain": _normalize_domain(r.domain),
+                    "client_ip": str(r.client_ip),
+                    "targeted": (bool(r.targeted) if r.targeted is not None else None),
+                    "count": int(r.count or 1),
+                }
+                buf.append(entry)
+            except Exception:
+                continue
+        # purge according to settings
+        ts_cfg = _get_telemetry_settings(st)
+        _purge_old_telemetry(st, now_ts, max_age_seconds=ts_cfg.get("retention_seconds", 7200), max_entries=int(ts_cfg.get("max_entries", 20000)))
+        _save_state(st)
+        return {"ok": True, "received": len(payload.rows)}
+
+
+@app.get("/v1/telemetry/dns-queries")
+def list_dns_queries(since: Optional[float] = None, limit: Optional[int] = 500, non_targeted: Optional[bool] = False):
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        now_ts = time.time()
+        _maybe_auto_clear_telemetry(st, now_ts)
+        ts_cfg = _get_telemetry_settings(st)
+        _purge_old_telemetry(st, now_ts, max_age_seconds=ts_cfg.get("retention_seconds", 7200), max_entries=int(ts_cfg.get("max_entries", 20000)))
+        since_ts = float(since) if since is not None else (now_ts - 3600.0)
+        entries = [e for e in st["telemetry"]["entries"] if float(e.get("ts", 0)) >= since_ts]
+        if non_targeted:
+            entries = [e for e in entries if e.get("targeted") is False]
+        # newest first
+        entries.sort(key=lambda x: float(x.get("ts", 0)), reverse=True)
+        if limit is not None:
+            try:
+                lim = int(limit)
+                if lim > 0:
+                    entries = entries[:lim]
+            except Exception:
+                pass
+        return {"items": entries, "count": len(entries)}
+
+
+@app.get("/v1/telemetry/top")
+def telemetry_top(since: Optional[float] = None, non_targeted: Optional[bool] = False, limit: Optional[int] = 50):
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        now_ts = time.time()
+        _maybe_auto_clear_telemetry(st, now_ts)
+        ts_cfg = _get_telemetry_settings(st)
+        _purge_old_telemetry(st, now_ts, max_age_seconds=ts_cfg.get("retention_seconds", 7200), max_entries=int(ts_cfg.get("max_entries", 20000)))
+        since_ts = float(since) if since is not None else (now_ts - 3600.0)
+        items = [e for e in st["telemetry"]["entries"] if float(e.get("ts", 0)) >= since_ts]
+        agg = {}
+        for e in items:
+            dom = _normalize_domain(e.get("domain", ""))
+            cip = str(e.get("client_ip"))
+            if not dom or not cip:
+                continue
+            if non_targeted and not (e.get("targeted") is False):
+                # only include explicitly non-targeted entries when requested
+                continue
+            key = dom
+            cur = agg.get(key)
+            cnt = int(e.get("count", 1) or 1)
+            ts_val = float(e.get("ts", 0))
+            if not cur:
+                agg[key] = {"domain": dom, "total": cnt, "clients": {cip}, "first_seen": ts_val, "last_seen": ts_val}
+            else:
+                cur["total"] += cnt
+                cur["clients"].add(cip)
+                if ts_val < cur["first_seen"]:
+                    cur["first_seen"] = ts_val
+                if ts_val > cur["last_seen"]:
+                    cur["last_seen"] = ts_val
+        # Build list and annotate current targeted status from config
+        rules = st.get("domains", [])
+        out = []
+        for dom, data in agg.items():
+            out.append({
+                "domain": dom,
+                "total": int(data["total"]),
+                "unique_clients": len(data["clients"]),
+                "first_seen": data["first_seen"],
+                "last_seen": data["last_seen"],
+                "targeted_current": _is_domain_targeted_now(dom, rules),
+            })
+        out.sort(key=lambda x: (int(x.get("total", 0)), float(x.get("last_seen", 0))), reverse=True)
+        if limit is not None:
+            try:
+                lim = int(limit)
+                if lim > 0:
+                    out = out[:lim]
+            except Exception:
+                pass
+        return {"items": out, "count": len(out)}
+
+
+@app.post("/v1/telemetry/promote", dependencies=[Depends(require_internal)])
+def telemetry_promote_domain(item: DomainItem):
+    """Convenience endpoint: add a domain to the controller list and bump domains_version."""
+    dom = _normalize_domain(item.domain if item else "")
+    if not dom:
+        raise HTTPException(status_code=400, detail="invalid domain")
+    with LOCK:
+        st = _load_state()
+        lst = st.get("domains", [])
+        # Normalize uniqueness (store without leading '*.')
+        core = dom.lstrip("*.")
+        if core not in lst:
+            lst.append(core)
+            st["domains"] = lst
+        st["domains_version"] = int(st.get("domains_version", 1)) + 1
+        _save_state(st)
+        return {"ok": True, "domain": core, "domains_version": st["domains_version"], "domains": st["domains"]}
+
+
+@app.post("/v1/telemetry/promote-suffix", dependencies=[Depends(require_internal)])
+def telemetry_promote_suffix(item: DomainItem):
+    """Promote the guessed root suffix (e.g., sub.example.com -> example.com)."""
+    dom = _normalize_domain(item.domain if item else "")
+    if not dom:
+        raise HTTPException(status_code=400, detail="invalid domain")
+    core = _guess_suffix(dom)
+    with LOCK:
+        st = _load_state()
+        lst = st.get("domains", [])
+        root = core.lstrip("*.")
+        if root not in lst:
+            lst.append(root)
+            st["domains"] = lst
+        st["domains_version"] = int(st.get("domains_version", 1)) + 1
+        _save_state(st)
+        return {"ok": True, "domain": root, "domains_version": st["domains_version"], "domains": st["domains"]}
+
+
+# ---- Telemetry settings and clear endpoints ----
+class TelemetrySettingsIn(BaseModel):
+    retention_seconds: Optional[int] = None
+    max_entries: Optional[int] = None
+    auto_clear_interval_seconds: Optional[int] = None
+    auto_clear_enabled: Optional[bool] = None
+
+
+def _ensure_telemetry_settings(st: dict) -> dict:
+    tele = st.setdefault("telemetry", {})
+    sett = tele.get("settings")
+    if not isinstance(sett, dict):
+        sett = {
+            "retention_seconds": 7200,
+            "max_entries": 20000,
+            "auto_clear_interval_seconds": 0,
+            "auto_clear_enabled": False,
+            "last_cleared_ts": None,
+            "next_clear_ts": None,
+        }
+    else:
+        # ensure defaults
+        sett.setdefault("retention_seconds", 7200)
+        sett.setdefault("max_entries", 20000)
+        sett.setdefault("auto_clear_interval_seconds", 0)
+        sett.setdefault("auto_clear_enabled", False)
+        sett.setdefault("last_cleared_ts", None)
+        sett.setdefault("next_clear_ts", None)
+    tele["settings"] = sett
+    st["telemetry"] = tele
+    return st
+
+
+def _get_telemetry_settings(st: dict) -> dict:
+    tele = st.get("telemetry", {})
+    sett = tele.get("settings") or {}
+    return sett
+
+
+def _clear_telemetry(st: dict, now_ts: Optional[float] = None):
+    if now_ts is None:
+        now_ts = time.time()
+    tele = st.setdefault("telemetry", {})
+    tele["entries"] = []
+    sett = tele.get("settings") or {}
+    sett["last_cleared_ts"] = now_ts
+    if sett.get("auto_clear_enabled") and int(sett.get("auto_clear_interval_seconds") or 0) > 0:
+        sett["next_clear_ts"] = now_ts + int(sett.get("auto_clear_interval_seconds"))
+    tele["settings"] = sett
+    st["telemetry"] = tele
+
+
+def _maybe_auto_clear_telemetry(st: dict, now_ts: Optional[float] = None):
+    if now_ts is None:
+        now_ts = time.time()
+    tele = st.get("telemetry", {})
+    sett = tele.get("settings") or {}
+    if not sett.get("auto_clear_enabled"):
+        return
+    interval = int(sett.get("auto_clear_interval_seconds") or 0)
+    if interval <= 0:
+        return
+    nxt = sett.get("next_clear_ts")
+    if nxt is None:
+        # schedule first clear in future
+        sett["next_clear_ts"] = now_ts + interval
+        tele["settings"] = sett
+        st["telemetry"] = tele
+        return
+    try:
+        if float(nxt) <= now_ts:
+            _clear_telemetry(st, now_ts)
+    except Exception:
+        return
+
+
+@app.get("/v1/telemetry/settings")
+def get_telemetry_settings():
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        _save_state(st)
+        return st["telemetry"]["settings"]
+
+
+@app.post("/v1/telemetry/settings", dependencies=[Depends(require_internal)])
+def set_telemetry_settings(settings: TelemetrySettingsIn):
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        sett = st["telemetry"]["settings"]
+        if settings.retention_seconds is not None:
+            sett["retention_seconds"] = max(60, int(settings.retention_seconds))
+        if settings.max_entries is not None:
+            sett["max_entries"] = max(1000, int(settings.max_entries))
+        if settings.auto_clear_interval_seconds is not None:
+            sett["auto_clear_interval_seconds"] = max(0, int(settings.auto_clear_interval_seconds))
+        if settings.auto_clear_enabled is not None:
+            sett["auto_clear_enabled"] = bool(settings.auto_clear_enabled)
+        # recalc next_clear_ts if enabling or changing interval
+        now_ts = time.time()
+        if sett.get("auto_clear_enabled") and int(sett.get("auto_clear_interval_seconds") or 0) > 0:
+            nxt = sett.get("next_clear_ts")
+            if not nxt:
+                sett["next_clear_ts"] = now_ts + int(sett.get("auto_clear_interval_seconds"))
+        else:
+            sett["next_clear_ts"] = None
+        st["telemetry"]["settings"] = sett
+        _save_state(st)
+        return sett
+
+
+@app.post("/v1/telemetry/clear", dependencies=[Depends(require_internal)])
+def clear_telemetry():
+    with LOCK:
+        st = _load_state()
+        st = _ensure_telemetry_defaults(st)
+        st = _ensure_telemetry_settings(st)
+        _clear_telemetry(st, time.time())
+        _save_state(st)
+        return {"ok": True, "cleared": True, "settings": st["telemetry"]["settings"]}

@@ -251,9 +251,87 @@
       </details>
     </div>
   </div>
-  </div>
 
-<script>
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-12">
+      <div class="section-head">
+        <h2>تله‌متری DNS (دامنه‌های پرتکرار)</h2>
+        <div class="toolbar">
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">
+            بازه (دقیقه): <input id="teleSinceMins" type="number" min="1" value="60" style="width:90px; margin-right:6px;" />
+          </label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="teleOnlyNonTargeted" /> فقط غیرهدف‌دار (عبور مستقیم)
+          </label>
+          <button id="btnTeleRefresh">رفرش</button>
+        </div>
+      </div>
+      <div id="teleCount" class="muted" style="margin-bottom:8px;">—</div>
+      <div style="overflow:auto;">
+        <table class="table-sticky">
+          <thead>
+            <tr>
+              <th>دامنه</th>
+              <th>کل درخواست</th>
+              <th>کلاینت‌های یکتا</th>
+              <th>هدف‌دار؟</th>
+              <th>اولین/آخرین مشاهده</th>
+              <th>عملیات</th>
+            </tr>
+          </thead>
+          <tbody id="teleTopBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-4">
+      <h2>تنظیمات تله‌متری</h2>
+      <div class="kv">
+        <b>Retention (ثانیه)</b><div><input id="teleRetentionSec" type="number" min="60" step="60" placeholder="7200" style="width:160px;" /></div>
+        <b>سقف رکوردها</b><div><input id="teleMaxEntries" type="number" min="1000" step="1000" placeholder="20000" style="width:160px;" /></div>
+        <b>پاک‌سازی خودکار</b><div><label><input id="teleAutoEnabled" type="checkbox" /> فعال</label></div>
+        <b>بازهٔ پاک‌سازی (ثانیه)</b><div><input id="teleAutoIntervalSec" type="number" min="0" step="60" placeholder="0" style="width:160px;" /></div>
+        <b>آخرین پاک‌سازی</b><div id="teleLastCleared">—</div>
+        <b>پاک‌سازی بعدی</b><div id="teleNextClear">—</div>
+      </div>
+      <div class="input-inline" style="margin-top:10px; gap:8px; flex-wrap:wrap;">
+        <button id="btnTeleSaveSettings" class="btn-primary">ذخیره تنظیمات</button>
+        <button id="btnTeleClear" style="background-color:#e74c3c; color:white;">پاک‌سازی اکنون</button>
+      </div>
+      <div class="muted" style="margin-top:6px;">Retention و سقف ورودی‌ها از رشد بیش از حد فایل state جلوگیری می‌کند. با فعال‌سازی پاک‌سازی خودکار، لاگ‌ها دوره‌ای صفر می‌شوند.</div>
+    </div>
+
+    <div class="card col-8">
+      <div class="section-head">
+        <h2>درخواست‌های اخیر (کلاینت/دامنه)</h2>
+        <div class="toolbar">
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">بازه (دقیقه): <input id="recSinceMins" type="number" min="1" value="60" style="width:90px;" /></label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px;"><input id="recOnlyNon" type="checkbox" /> فقط غیرهدف‌دار</label>
+          <input id="recClient" placeholder="فیلتر IP کلاینت" style="width:160px;" />
+          <input id="recDomain" placeholder="جستجوی دامنه" style="width:200px;" />
+          <button id="btnRecRefresh">رفرش</button>
+        </div>
+      </div>
+      <div style="overflow:auto;">
+        <table class="table-sticky">
+          <thead>
+            <tr>
+              <th>زمان</th>
+              <th>کلاینت</th>
+              <th>دامنه</th>
+              <th>هدف‌دار؟</th>
+              <th>تعداد</th>
+              <th>عملیات</th>
+            </tr>
+          </thead>
+          <tbody id="recBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  
+  <script>
 function getInternalToken(){
   try { return localStorage.getItem('INTERNAL_TOKEN') || ''; } catch(e){ return ''; }
 }
@@ -270,6 +348,196 @@ const api = (path, opts={}) => {
   }
   return fetch(path, merged);
 };
+
+// ===== Telemetry helpers & loaders =====
+function fmtTime(ts){
+  try{
+    if(!ts && ts!==0) return '—';
+    const d = new Date(parseFloat(ts)*1000);
+    return d.toLocaleString('fa-IR');
+  }catch(_){ return '—'; }
+}
+
+async function loadTelemetrySettings(){
+  try{
+    const r = await api('/v1/telemetry/settings');
+    if(!r.ok) return;
+    const s = await r.json();
+    const g = id => document.getElementById(id);
+    if(g('teleRetentionSec')) g('teleRetentionSec').value = s.retention_seconds ?? '';
+    if(g('teleMaxEntries')) g('teleMaxEntries').value = s.max_entries ?? '';
+    if(g('teleAutoEnabled')) g('teleAutoEnabled').checked = !!s.auto_clear_enabled;
+    if(g('teleAutoIntervalSec')) g('teleAutoIntervalSec').value = s.auto_clear_interval_seconds ?? '';
+    if(g('teleLastCleared')) g('teleLastCleared').textContent = fmtTime(s.last_cleared_ts);
+    if(g('teleNextClear')) g('teleNextClear').textContent = fmtTime(s.next_clear_ts);
+  }catch(_){ /* ignore */ }
+}
+
+async function loadTelemetryTop(){
+  try{
+    const mins = parseInt(document.getElementById('teleSinceMins')?.value || '60', 10) || 60;
+    const since = Math.floor(Date.now()/1000) - (mins * 60);
+    const onlyNon = !!document.getElementById('teleOnlyNonTargeted')?.checked;
+    const url = `/v1/telemetry/top?since=${encodeURIComponent(since)}&non_targeted=${onlyNon ? 'true' : 'false'}&limit=200`;
+    const r = await api(url);
+    if(!r.ok){
+      const t = await r.text();
+      document.getElementById('teleCount').textContent = 'خطا در دریافت تله‌متری: ' + (t||r.status);
+      return;
+    }
+    const j = await r.json();
+    const body = document.getElementById('teleTopBody');
+    body.innerHTML = '';
+    (j.items || []).forEach(row => {
+      const tr = document.createElement('tr');
+      const targeted = row.targeted_current ? '<span class="status ok">هدف‌دار</span>' : '<span class="status warn">غیرهدف‌دار</span>';
+      const fs = row.first_seen ? fmtAgo(row.first_seen) : '—';
+      const ls = row.last_seen ? fmtAgo(row.last_seen) : '—';
+      tr.innerHTML = `
+        <td><code>${row.domain}</code></td>
+        <td>${row.total}</td>
+        <td>${row.unique_clients}</td>
+        <td>${targeted}</td>
+        <td>${fs} / ${ls}</td>
+        <td>
+          ${row.targeted_current ? '' : `
+            <div class="input-inline" style="gap:6px;">
+              <button class="btnPromote" data-d="${row.domain}">افزودن دامنه</button>
+              <button class="btnPromoteSuffix" data-d="${row.domain}">افزودن ریشه</button>
+            </div>
+          `}
+        </td>
+      `;
+      body.appendChild(tr);
+    });
+    const cnt = document.getElementById('teleCount');
+    if(cnt){
+      const onlyNonNote = (document.getElementById('teleOnlyNonTargeted')?.checked ? ' (فقط غیرهدف‌دار)' : '');
+      cnt.textContent = `تعداد: ${(j.items||[]).length}${onlyNonNote}`;
+    }
+    // wire promote buttons
+    body.querySelectorAll('.btnPromote').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        if(!dom) return;
+        try{
+          const r2 = await api('/v1/telemetry/promote', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن دامنه: ' + t); return; }
+          await Promise.all([loadDomains(), loadConfig()]);
+          await loadTelemetryTop();
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
+    body.querySelectorAll('.btnPromoteSuffix').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        if(!dom) return;
+        try{
+          const r2 = await api('/v1/telemetry/promote-suffix', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن ریشه: ' + t); return; }
+          await Promise.all([loadDomains(), loadConfig()]);
+          await loadTelemetryTop();
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
+  }catch(e){
+    document.getElementById('teleCount').textContent = 'خطا در تله‌متری: ' + (e?.message || e);
+  }
+}
+
+async function loadTelemetryRecents(){
+  try{
+    const mins = parseInt(document.getElementById('recSinceMins')?.value || '60', 10) || 60;
+    const since = Math.floor(Date.now()/1000) - (mins * 60);
+    const onlyNon = !!document.getElementById('recOnlyNon')?.checked;
+    const r = await api(`/v1/telemetry/dns-queries?since=${encodeURIComponent(since)}&non_targeted=${onlyNon?'true':'false'}&limit=1000`);
+    if(!r.ok) return;
+    const j = await r.json();
+    const fCli = (document.getElementById('recClient')?.value || '').trim();
+    const fDom = (document.getElementById('recDomain')?.value || '').trim().toLowerCase();
+    const body = document.getElementById('recBody');
+    body.innerHTML = '';
+    (j.items || []).filter(e => {
+      if(fCli && String(e.client_ip) !== fCli) return false;
+      if(fDom && !String(e.domain||'').toLowerCase().includes(fDom)) return false;
+      return true;
+    }).forEach(e => {
+      const targeted = (e.targeted===true) ? '<span class="status ok">هدف‌دار</span>' : (e.targeted===false ? '<span class="status warn">غیرهدف‌دار</span>' : '—');
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td title="${fmtTime(e.ts)}">${fmtAgo(e.ts||0)}</td>
+        <td class="cell-ip"><code>${e.client_ip||''}</code></td>
+        <td><code>${e.domain||''}</code></td>
+        <td>${targeted}</td>
+        <td>${e.count||1}</td>
+        <td>
+          <div class="input-inline" style="gap:6px;">
+            <button class="btnRecPromote" data-d="${e.domain}">افزودن دامنه</button>
+            <button class="btnRecPromoteSuffix" data-d="${e.domain}">افزودن ریشه</button>
+          </div>
+        </td>
+      `;
+      body.appendChild(tr);
+    });
+    body.querySelectorAll('.btnRecPromote').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        try{
+          const r2 = await api('/v1/telemetry/promote', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن دامنه: ' + t); return; }
+          await Promise.all([loadDomains(), loadConfig()]);
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
+    body.querySelectorAll('.btnRecPromoteSuffix').forEach(btn => {
+      btn.onclick = async () => {
+        const dom = btn.getAttribute('data-d');
+        try{
+          const r2 = await api('/v1/telemetry/promote-suffix', { method:'POST', body: JSON.stringify({ domain: dom }) });
+          const t = await r2.text();
+          if(!r2.ok){ alert('خطا در افزودن ریشه: ' + t); return; }
+          await Promise.all([loadDomains(), loadConfig()]);
+        }catch(e){ alert('خطا: ' + (e?.message || e)); }
+      };
+    });
+  }catch(_){ /* ignore */ }
+}
+
+// Telemetry listeners
+document.getElementById('btnTeleRefresh')?.addEventListener('click', async () => {
+  await loadTelemetryTop();
+});
+document.getElementById('btnRecRefresh')?.addEventListener('click', async () => {
+  await loadTelemetryRecents();
+});
+document.getElementById('btnTeleSaveSettings')?.addEventListener('click', async () => {
+  const payload = {};
+  const g = id => document.getElementById(id);
+  const rs = parseInt(g('teleRetentionSec')?.value || ''); if(!isNaN(rs)) payload.retention_seconds = rs;
+  const me = parseInt(g('teleMaxEntries')?.value || ''); if(!isNaN(me)) payload.max_entries = me;
+  const en = !!g('teleAutoEnabled')?.checked; payload.auto_clear_enabled = en;
+  const iv = parseInt(g('teleAutoIntervalSec')?.value || ''); if(!isNaN(iv)) payload.auto_clear_interval_seconds = iv;
+  try{
+    const r = await api('/v1/telemetry/settings', { method:'POST', body: JSON.stringify(payload) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در ذخیره تنظیمات تله‌متری: ' + t); return; }
+    await loadTelemetrySettings();
+    alert('تنظیمات تله‌متری ذخیره شد.');
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
+  if(!confirm('کل لاگ‌های تله‌متری پاک شود؟')) return;
+  try{
+    const r = await api('/v1/telemetry/clear', { method:'POST' });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در پاک‌سازی: ' + t); return; }
+    await Promise.all([loadTelemetrySettings(), loadTelemetryTop(), loadTelemetryRecents()]);
+    alert('پاک شد.');
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
 let APP = { cfg: null, refreshTimer: null, domainsAll: [] };
 
 // moved from <style>: load UI settings from controller
@@ -619,6 +887,7 @@ async function loadNodes(){
 
 async function init(){
   await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
+  await Promise.all([loadTelemetrySettings(), loadTelemetryTop(), loadTelemetryRecents()]);
   updateTokenUI();
 }
 

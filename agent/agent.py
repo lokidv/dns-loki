@@ -19,6 +19,7 @@ WORK_DIR = "/opt/dns-proxy"
 DOMAINS_DIR = f"{WORK_DIR}/domains"
 LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
 LOG_FILE = f"{WORK_DIR}/agent/agent.log"
+TELE_LAST_FILE = f"{WORK_DIR}/agent/telemetry_last_ts"
 
 
 def run(cmd, check=True):
@@ -496,6 +497,120 @@ def tls_probe_latency(ip: str, sni_host: str, timeout=3.0):
         return False, None
 
 
+def _iso8601(ts: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _read_last_ts(path: str, default_delta: float = 15.0) -> float:
+    try:
+        if Path(path).exists():
+            return float(Path(path).read_text().strip())
+    except Exception:
+        pass
+    # default: a short lookback to avoid huge log windows
+    return time.time() - default_delta
+
+
+def _write_last_ts(path: str, ts: float):
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(str(float(ts)))
+    except Exception as e:
+        log(f"telemetry: failed writing last ts -> {e}")
+
+
+def _parse_coredns_log_line(line: str):
+    """Best-effort parse of a CoreDNS 'log' plugin line.
+    Returns (client_ip, domain, qtype) or (None, None, None) on failure.
+    Example line:
+    [INFO] 192.0.2.3:56512 - 39238 "A IN example.com. udp 79 false 512" NOERROR qr,rd,ra 205 0.003123839s
+    """
+    try:
+        txt = line.strip()
+        if not txt:
+            return None, None, None
+        # extract client ip
+        m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", txt)
+        if not m_ip:
+            return None, None, None
+        cip = m_ip.group(1)
+        # extract quoted query section
+        m_q = re.search(r'"([^"]+)"', txt)
+        if not m_q:
+            return cip, None, None
+        q = m_q.group(1)
+        parts = q.split()
+        if len(parts) < 3:
+            return cip, None, None
+        qtype = parts[0]
+        domain = parts[2].rstrip('.')
+        return cip, domain.lower(), qtype
+    except Exception:
+        return None, None, None
+
+
+def _domain_targeted(domain: str, rules) -> bool:
+    try:
+        d = (domain or '').strip('.').lower()
+        for r in (rules or []):
+            rr = str(r).lstrip('*.').lower()
+            if not rr:
+                continue
+            if d == rr or d.endswith('.' + rr):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _collect_dns_telemetry(domains_rules, last_ts: float):
+    """Collect CoreDNS logs since last_ts using docker logs; return rows list and new_ts.
+    rows: list of (client_ip, domain, qtype)
+    """
+    now_ts = time.time()
+    iso = _iso8601(last_ts)
+    lines = []
+    # try docker logs first (container name is 'coredns')
+    try:
+        res = run(f"docker logs --since '{iso}' coredns", check=False)
+        if res.returncode == 0 and res.stdout:
+            try:
+                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+            except Exception:
+                txt = str(res.stdout)
+            lines = [l for l in txt.splitlines() if l.strip()]
+    except Exception:
+        lines = []
+    # future: optionally journalctl for native
+    rows = []
+    for ln in lines:
+        cip, dom, qtype = _parse_coredns_log_line(ln)
+        if not cip or not dom:
+            continue
+        # Only consider A/AAAA to match our targeting model
+        if qtype and qtype not in ("A", "AAAA"):
+            continue
+        rows.append((cip, dom, qtype or ""))
+    # aggregate by (domain, client_ip)
+    agg = {}
+    for (cip, dom, _qt) in rows:
+        key = (dom, cip)
+        agg[key] = agg.get(key, 0) + 1
+    # build payload rows
+    out_rows = []
+    for (dom, cip), cnt in agg.items():
+        out_rows.append({
+            "domain": dom,
+            "client_ip": cip,
+            "targeted": _domain_targeted(dom, domains_rules),
+            "count": int(cnt),
+        })
+    return out_rows, now_ts
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -664,6 +779,21 @@ def main():
             _ensure_acl_symlink()
             # Reload CoreDNS
             reload_coredns()
+
+            # Collect and send DNS telemetry (best-effort, non-fatal)
+            try:
+                last_ts = _read_last_ts(TELE_LAST_FILE)
+                tele_rows, new_ts = _collect_dns_telemetry(domains, last_ts)
+                if tele_rows:
+                    payload = {"node_ip": my_ip, "ts": new_ts, "rows": tele_rows}
+                    try:
+                        requests.post(f"{controller_url}/v1/telemetry/dns-queries", json=payload, timeout=5, headers=headers)
+                        log(f"telemetry: sent {len(tele_rows)} rows")
+                    except Exception as e:
+                        log(f"telemetry: post failed -> {e}")
+                _write_last_ts(TELE_LAST_FILE, new_ts)
+            except Exception as e:
+                log(f"telemetry: failed -> {e}")
 
         if role == "proxy":
             log(f"proxy: applying policy -> enforce={enforce_proxy}")
