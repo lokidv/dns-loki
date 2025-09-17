@@ -12,6 +12,8 @@ from pathlib import Path
 import tempfile
 import zipfile
 from urllib.request import urlopen
+import threading
+import collections
 
 DEF_CORE_DNS_DIR = "/opt/dns-proxy/docker/dns"
 DEF_PROXY_DIR = "/opt/dns-proxy/docker/proxy"
@@ -20,6 +22,83 @@ DOMAINS_DIR = f"{WORK_DIR}/domains"
 LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
 LOG_FILE = f"{WORK_DIR}/agent/agent.log"
 TELE_LAST_FILE = f"{WORK_DIR}/agent/telemetry_last_ts"
+
+# Live DNS sniffer globals
+SNIFF_RING = collections.deque(maxlen=5000)  # (ts, client_ip, domain, qtype)
+SNIFF_LOCK = threading.Lock()
+SNIFF_THR = None
+SNIFF_RUNNING = False
+
+
+def _ensure_dns_sniffer_running():
+    """Start a background tcpdump-based DNS sniffer if available and not running."""
+    global SNIFF_THR, SNIFF_RUNNING
+    if SNIFF_RUNNING:
+        return
+    if not shutil.which("tcpdump"):
+        try:
+            log("sniffer: tcpdump not found; live DNS sniff disabled")
+        except Exception:
+            pass
+        return
+    def _loop():
+        global SNIFF_RUNNING
+        SNIFF_RUNNING = True
+        try:
+            # Capture UDP/TCP:53 queries on any iface; -l for line-buffered output
+            # Note: do not use '-tt' to keep output simple; we add our own ts
+            proc = subprocess.Popen(
+                ["tcpdump", "-i", "any", "-l", "-n", "-vvv", "-s", "0", "(udp or tcp)", "and", "port", "53"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+            if not proc or not proc.stdout:
+                return
+            for ln in proc.stdout:
+                if not ln:
+                    continue
+                # Only consider lines that look like queries (contain '?')
+                if '?' not in ln:
+                    continue
+                cip, dom, qtype = _parse_tcpdump_dns_line(ln)
+                if not cip or not dom:
+                    continue
+                if dom.endswith('.arpa'):
+                    continue
+                with SNIFF_LOCK:
+                    SNIFF_RING.append((time.time(), str(cip), str(dom).lower(), (qtype or '').upper()))
+        except Exception as e:
+            try:
+                log(f"sniffer: exception -> {e}")
+            except Exception:
+                pass
+        finally:
+            SNIFF_RUNNING = False
+    try:
+        SNIFF_THR = threading.Thread(target=_loop, name="dns-sniffer", daemon=True)
+        SNIFF_THR.start()
+        try:
+            log("sniffer: started background tcpdump thread")
+        except Exception:
+            pass
+    except Exception:
+        SNIFF_RUNNING = False
+
+
+def _sniff_rows_since(ts_from: float):
+    """Return list of (client_ip, domain, qtype) from ring with ts >= ts_from."""
+    rows = []
+    try:
+        with SNIFF_LOCK:
+            for (ts, cip, dom, qt) in list(SNIFF_RING):
+                if ts >= ts_from:
+                    rows.append((cip, dom, qt))
+    except Exception:
+        return []
+    return rows
 
 
 def run(cmd, check=True):
@@ -507,7 +586,12 @@ def _iso8601(ts: float) -> str:
 def _read_last_ts(path: str, default_delta: float = 15.0) -> float:
     try:
         if Path(path).exists():
-            return float(Path(path).read_text().strip())
+            val = float(Path(path).read_text().strip())
+            now = time.time()
+            # Clamp to now - default_delta if file contains a future timestamp
+            if val > now:
+                return now - default_delta
+            return val
     except Exception:
         pass
     # default: a short lookback to avoid huge log windows
@@ -558,6 +642,66 @@ def _parse_coredns_log_line(line: str):
         return cip, None, None
     except Exception:
         return None, None, None
+
+
+def _parse_tcpdump_dns_line(line: str):
+    """Parse a tcpdump -vvv -n line for DNS query attempts.
+    Returns (client_ip, domain, qtype) or (None, None, None).
+    Example:
+      IP 192.0.2.3.56512 > 10.0.0.1.53: 39238+ A? example.com. (28)
+      IP6 2001:db8::1.56512 > 10.0.0.1.53: 39238+ HTTPS? example.com. (65)
+    """
+    try:
+        s = line.strip()
+        if not s:
+            return None, None, None
+        m_ep = re.search(r"^(?:IP6?|IP)\s+([^\s>]+)\s+>\s+[^\s:]+:", s)
+        if not m_ep:
+            return None, None, None
+        ep = m_ep.group(1)
+        # client endpoint looks like 1.2.3.4.12345 or 2001:db8::1.12345
+        if '.' in ep:
+            cip = ep.rsplit('.', 1)[0]
+        else:
+            cip = ep  # best effort
+        m_q = re.search(r"\s([A-Z0-9]+)\?\s+([A-Za-z0-9_.-]+)\.?\s", s)
+        if not m_q:
+            return None, None, None
+        qtype = m_q.group(1).upper()
+        dom = m_q.group(2).strip('.').lower()
+        return cip, dom, qtype
+    except Exception:
+        return None, None, None
+
+
+def _collect_live_dns_sniff(timeout_seconds: int = 2):
+    """Best-effort live capture of DNS queries using tcpdump for a short time.
+    Requires tcpdump to be installed and sufficient privileges. Returns list of (client_ip, domain, qtype).
+    """
+    try:
+        cmd = f"timeout {int(timeout_seconds)} tcpdump -i any -l -n -vvv -s 0 udp port 53"
+        res = run(cmd, check=False)
+        if getattr(res, 'stdout', None):
+            try:
+                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
+            except Exception:
+                txt = str(res.stdout)
+            rows = []
+            for ln in txt.splitlines():
+                # Only consider query lines, which include '?'
+                if '?' not in ln:
+                    continue
+                cip, dom, qtype = _parse_tcpdump_dns_line(ln)
+                if not cip or not dom:
+                    continue
+                # Skip reverse lookups noise
+                if dom.endswith('.arpa'):
+                    continue
+                rows.append((cip, dom, qtype or ''))
+            return rows
+    except Exception:
+        pass
+    return []
 
 
 def _domain_targeted(domain: str, rules) -> bool:
@@ -658,6 +802,10 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
             continue
         # Keep all other types (we want to see attempts regardless of success/type)
         rows.append((cip, dlow, (qtype or "").upper()))
+    # Merge in rows from continuous sniffer since last_ts, if available
+    sniff_rows_ring = _sniff_rows_since(last_ts)
+    if sniff_rows_ring:
+        rows.extend(sniff_rows_ring)
     # aggregate by (domain, client_ip)
     agg = {}
     for (cip, dom, _qt) in rows:
@@ -672,6 +820,10 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
             "targeted": _domain_targeted(dom, domains_rules),
             "count": int(cnt),
         })
+    try:
+        log(f"telemetry: parsed lines={len(lines)} rows_combined={len(rows)} unique_pairs={len(agg)}")
+    except Exception:
+        pass
     return out_rows, now_ts
 
 
@@ -808,6 +960,11 @@ def main():
 
         healthy = []
         if role == "dns":
+            # Ensure live sniffer is running to capture query attempts immediately
+            try:
+                _ensure_dns_sniffer_running()
+            except Exception:
+                pass
             log(f"dns: applying policy -> enforce={enforce_dns}")
             apply_dns_policy(enforce_dns)
             # Update nft set of allowed dns clients
