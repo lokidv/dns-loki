@@ -61,7 +61,17 @@ sudo ./scripts/install.sh \
   --role dns \
   --controller-url http://<CONTROLLER_IP>:8080
 ```
-
+or with custom branch
+```bash
+apt-get update -y && apt-get install -y git
+git clone --branch withhistory --single-branch https://github.com/lokidv/dns-loki.git
+cd dns-loki
+cd scripts/
+chmod +x install.sh 
+sudo ./install.sh \
+  --role dns \
+  --controller-url http://<CONTROLLER_IP>:8080
+```
 4) همگام‌سازی دامنه‌ها و بررسی فایل‌های override روی نود DNS
 ```bash
 curl -sS -X POST http://<CONTROLLER_IP>:8080/v1/domains/sync \
@@ -201,6 +211,13 @@ sudo ./scripts/install.sh \
   --role controller \
   --bind 0.0.0.0:8080 \
   
+or custom branch
+apt-get update -y && apt-get install -y git
+git clone --branch withhistory --single-branch https://github.com/lokidv/dns-loki.git
+cd dns-loki
+cd scripts/
+chmod +x install.sh 
+sudo ./install.sh --role controller --bind 0.0.0.0:8080 
 
 # Optional hardening later: set HOST=127.0.0.1 in /opt/dns-proxy/controller/.env and restart service
 ```

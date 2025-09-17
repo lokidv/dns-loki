@@ -1180,7 +1180,7 @@ def force_reset_agents():
 
 @app.post("/v1/code/self-update", dependencies=[Depends(require_internal)])
 def self_update_controller():
-    """Download latest code and update controller files and UI, then restart service in background."""
+    """Start a background self-update. Returns immediately to avoid blocking the server/UI."""
     with LOCK:
         st = _load_state()
         repo = st.get("code_repo") or "https://github.com/lokidv/dns-loki.git"
@@ -1190,55 +1190,70 @@ def self_update_controller():
     if not url:
         raise HTTPException(status_code=400, detail="Unsupported repo URL (only GitHub is supported)")
 
-    tmpdir = tempfile.mkdtemp(prefix="dns_loki_upd_")
-    zip_path = os.path.join(tmpdir, "src.zip")
-    try:
-        with urlopen(url, timeout=30) as resp, open(zip_path, "wb") as f:
-            shutil.copyfileobj(resp, f)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmpdir)
-        # find extracted root (robust for any repo name)
-        root = None
-        for name in os.listdir(tmpdir):
-            p = os.path.join(tmpdir, name)
-            if os.path.isdir(p):
-                # prefer a directory that contains controller/api.py
-                if os.path.exists(os.path.join(p, "controller", "api.py")):
-                    root = p
-                    break
-                if root is None:
-                    root = p
-        if not root:
-            raise HTTPException(status_code=500, detail="Cannot locate extracted source root (zip format unexpected)")
-
-        # copy controller files
-        shutil.copy2(os.path.join(root, "controller", "api.py"), "/opt/dns-proxy/controller/api.py")
-        if os.path.exists(os.path.join(root, "controller", "requirements.txt")):
-            shutil.copy2(os.path.join(root, "controller", "requirements.txt"), "/opt/dns-proxy/controller/requirements.txt")
-        # copy UI
-        ui_src = os.path.join(root, "controller", "ui")
-        if os.path.isdir(ui_src):
-            if os.path.isdir("/opt/dns-proxy/controller/ui"):
-                shutil.rmtree("/opt/dns-proxy/controller/ui")
-            _copy_tree(ui_src, "/opt/dns-proxy/controller/ui")
-        # upgrade controller deps
+    def _do_update(download_url: str):
+        tmpdir = tempfile.mkdtemp(prefix="dns_loki_upd_")
+        zip_path = os.path.join(tmpdir, "src.zip")
         try:
-            subprocess.run([
-                "/opt/dns-proxy/controller/venv/bin/pip", "install", "-r", "/opt/dns-proxy/controller/requirements.txt"
-            ], check=False)
+            try:
+                with urlopen(download_url, timeout=45) as resp, open(zip_path, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except Exception:
+                return
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(tmpdir)
+            except Exception:
+                return
+            # find extracted root (robust for any repo name)
+            root = None
+            for name in os.listdir(tmpdir):
+                p = os.path.join(tmpdir, name)
+                if os.path.isdir(p):
+                    if os.path.exists(os.path.join(p, "controller", "api.py")):
+                        root = p
+                        break
+                    if root is None:
+                        root = p
+            if not root:
+                return
+
+            # copy controller files
+            try:
+                shutil.copy2(os.path.join(root, "controller", "api.py"), "/opt/dns-proxy/controller/api.py")
+                req_src = os.path.join(root, "controller", "requirements.txt")
+                if os.path.exists(req_src):
+                    shutil.copy2(req_src, "/opt/dns-proxy/controller/requirements.txt")
+            except Exception:
+                # continue; best-effort
+                pass
+
+            # copy UI
+            ui_src = os.path.join(root, "controller", "ui")
+            try:
+                if os.path.isdir(ui_src):
+                    if os.path.isdir("/opt/dns-proxy/controller/ui"):
+                        shutil.rmtree("/opt/dns-proxy/controller/ui")
+                    _copy_tree(ui_src, "/opt/dns-proxy/controller/ui")
+            except Exception:
+                pass
+
+            # upgrade controller deps (best-effort, non-blocking to errors)
+            try:
+                subprocess.run([
+                    "/opt/dns-proxy/controller/venv/bin/pip", "install", "-r", "/opt/dns-proxy/controller/requirements.txt"
+                ], check=False)
+            except Exception:
+                pass
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # restart controller after short delay
+        try:
+            subprocess.Popen(["bash", "-lc", "sleep 1; systemctl restart dns-proxy-controller.service || systemctl restart dns-proxy-controller"])
         except Exception:
             pass
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # restart controller in background after short delay
-    try:
-        subprocess.Popen([
-            "bash", "-lc", "sleep 1; systemctl restart dns-proxy-controller"
-        ])
-    except Exception:
-        pass
-
+    threading.Thread(target=_do_update, args=(url,), daemon=True).start()
     return {"ok": True, "restarting": True}
 
 
