@@ -226,6 +226,43 @@
     
   </div>
 
+  <!-- Scanner Mode Panel -->
+  <div class="row" style="margin-top:16px;">
+    <div class="card col-12">
+      <div class="section-head">
+        <h2>اسکنر (Scanner Mode)</h2>
+        <div class="toolbar">
+          <button id="btnScanRefresh">رفرش</button>
+        </div>
+      </div>
+      <div class="kv">
+        <b>وضعیت</b><div id="scanStatus">—</div>
+        <b>مانده</b><div id="scanRemaining">—</div>
+      </div>
+      <div class="divider"></div>
+      <div class="grid-2">
+        <div>
+          <div class="input-inline" style="gap:8px; flex-wrap:wrap; align-items:center;">
+            <label style="min-width:120px;">IP کلاینت‌ها</label>
+            <input id="scanClients" placeholder="مثلاً 192.0.2.10, 198.51.100.20" style="min-width:360px;" />
+          </div>
+          <div class="input-inline" style="gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px;">
+            <label style="min-width:120px;">مدت (ثانیه)</label>
+            <input id="scanDuration" type="number" min="10" max="3600" value="300" style="width:120px;" />
+            <label><input type="checkbox" id="scanBlockQuic" checked /> بستن QUIC (UDP/443)</label>
+          </div>
+        </div>
+        <div class="input-inline" style="gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center;">
+          <button id="btnScanStart" class="btn-primary">شروع اسکن</button>
+          <button id="btnScanStop" style="background-color:#e74c3c; color:white;">توقف</button>
+        </div>
+      </div>
+      <div class="muted" style="margin-top:8px;">
+        در حالت اسکن، پاسخ A برای کل دامنه‌ها به پروکسی برگردانده می‌شود و برای کلاینت‌های انتخاب‌شده، UDP/443 (QUIC) مسدود می‌گردد تا SNI/Host به‌صورت کامل لاگ شود.
+      </div>
+    </div>
+  </div>
+
   <div class="row" style="margin-top:16px;">
     <div class="card col-12">
       <h2>نودها</h2>
@@ -683,6 +720,60 @@ document.getElementById('btnTeleClear')?.addEventListener('click', async () => {
     alert('پاک شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
+
+// Scanner Mode UI
+async function loadScannerStatus(){
+  try{
+    const r = await api('/v1/scanner');
+    if(!r.ok) return;
+    const j = await r.json();
+    const s = document.getElementById('scanStatus');
+    const rem = document.getElementById('scanRemaining');
+    if(s) s.textContent = j.active ? 'فعال' : 'غیرفعال';
+    if(rem) rem.textContent = j.active ? (j.remaining_sec + ' ثانیه') : '—';
+    const inp = document.getElementById('scanClients');
+    if(inp && Array.isArray(j.clients)) inp.value = j.clients.join(', ');
+    const chk = document.getElementById('scanBlockQuic');
+    if(chk) chk.checked = !!j.block_quic;
+  }catch(e){ /* ignore */ }
+}
+
+function parseScannerClients(){
+  const raw = (document.getElementById('scanClients')?.value || '').trim();
+  if(!raw) return [];
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+document.getElementById('btnScanRefresh')?.addEventListener('click', async ()=>{
+  await loadScannerStatus();
+});
+
+document.getElementById('btnScanStart')?.addEventListener('click', async ()=>{
+  const clients = parseScannerClients();
+  if(!clients.length){ alert('لطفاً حداقل یک IP وارد کنید.'); return; }
+  const dur = parseInt(document.getElementById('scanDuration')?.value || '300', 10);
+  const block_quic = !!document.getElementById('scanBlockQuic')?.checked;
+  try{
+    const r = await api('/v1/scanner/start', { method:'POST', body: JSON.stringify({ clients, duration_sec: dur, block_quic }) });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در شروع اسکن: ' + t); return; }
+    await loadScannerStatus();
+    alert('اسکن فعال شد.');
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+
+document.getElementById('btnScanStop')?.addEventListener('click', async ()=>{
+  try{
+    const r = await api('/v1/scanner/stop', { method:'POST' });
+    const t = await r.text();
+    if(!r.ok){ alert('خطا در توقف اسکن: ' + t); return; }
+    await loadScannerStatus();
+    alert('اسکن متوقف شد.');
+  }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+
+
+// Global state
 let APP = { cfg: null, refreshTimer: null, domainsAll: [], clientsAll: [], teleTopItems: [], recItems: [], activeView: 'home' };
 
 // Helpers: badge, CSV, filters persistence
@@ -758,7 +849,7 @@ function setActiveTab(){
 async function refreshActive(){
   if(APP.activeView === 'home'){
     await Promise.all([
-      loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings(),
+      loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings(), loadScannerStatus(),
     ]);
     await loadServerTokenStatus();
   } else {
@@ -1131,7 +1222,7 @@ async function loadNodes(){
 
 async function init(){
   // initial load for home
-  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings()]);
+  await Promise.all([loadConfig(), loadDomains(), loadClients(), loadNodes(), loadServerTokenStatus(), loadUiSettings(), loadScannerStatus()]);
   updateTokenUI();
 }
 
