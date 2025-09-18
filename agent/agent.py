@@ -512,9 +512,18 @@ def render_coredns_targets(domains, healthy_ips):
     ttl = 60
     for ip in healthy_ips:
         lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
-    lines.append("  fallthrough")
+    lines.append("}")
+    # Block modern alias/hint records that may instruct clients to bypass A answers
+    lines.append("template IN HTTPS {")
+    lines.append(f"  match {regex}")
+    lines.append("  rcode NOERROR")
+    lines.append("}")
+    lines.append("template IN SVCB {")
+    lines.append(f"  match {regex}")
+    lines.append("  rcode NOERROR")
     lines.append("}")
     return "\n".join(lines) + "\n"
+
 
 def render_scanner_targets(healthy_ips):
     """Catch-all CoreDNS template to direct ALL A queries to selected proxy IPs.
