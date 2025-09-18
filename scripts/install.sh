@@ -44,7 +44,7 @@ if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
 fi
 
 apt-get update -y
-apt-get install -y curl git nftables python3 python3-venv python3-pip tcpdump
+apt-get install -y curl git nftables python3 python3-venv python3-pip
 
 # Docker
 if ! command -v docker >/dev/null 2>&1; then

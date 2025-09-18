@@ -276,37 +276,6 @@ Agent on nodes will update nftables sets `allow_dns_clients` and `allow_proxy_cl
 
 ---
 
-## Scanner Mode — مشاهده کامل ترافیک یک دستگاه (PUBG و ...)
-
-برای کشف سریع تمام دامنه‌های یک اپ/بازی روی یک دستگاه، از "Scanner Mode" استفاده کنید. این حالت موقتاً همهٔ A رکوردها را برای آن دستگاه به Proxy برمی‌گرداند و UDP/443 (QUIC) را می‌بندد تا SNI/Host کامل در sniproxy لاگ شود.
-
-1) فعال‌سازی از طریق UI
-- در Home، بخش "اسکنر (Scanner Mode)" را باز کنید.
-- IP دستگاه (مثلاً موبایل) را در "IP کلاینت‌ها" وارد کنید. می‌توانید چند IP با کاما وارد کنید.
-- مدت (ثانیه) را انتخاب کنید (پیشنهاد: 300 ثانیه).
-- گزینه "بستن QUIC (UDP/443)" را روشن بگذارید.
-- روی "شروع اسکن" بزنید، اپ/بازی را اجرا کنید، سپس به تب History بروید و دامنه‌های مشاهده‌شده را Promote کنید.
-- بعد از اتمام، "توقف" را بزنید (یا تا پایان زمان منتظر بمانید).
-
-2) فعال‌سازی با API
-```bash
-curl -X POST http://<CONTROLLER_IP>:8080/v1/scanner/start \
-  -H 'Content-Type: application/json' \
-  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
-  -d '{"clients":["<DEVICE_IP>"], "duration_sec":300, "block_quic":true}'
-
-curl http://<CONTROLLER_IP>:8080/v1/scanner
-
-curl -X POST http://<CONTROLLER_IP>:8080/v1/scanner/stop \
-  -H 'X-Internal-Token: <INTERNAL_TOKEN>'
-```
-
-نکات:
-- برای محدود کردن اثر اسکنر فقط به دستگاه‌های مشخص، پیشنهاد می‌شود `enforce_dns_clients` روشن باشد و IP دستگاه در Clients اضافه شده باشد.
-- در زمان اسکن، AAAA برای همهٔ دامنه‌ها NOERROR می‌شود تا IPv6 دور نزند. ترافیک HTTPS از طریق TCP با SNI دیده می‌شود.
-
----
-
 ## 5) Automation and integration (Site ↔ Controller)
 
 - منبع واحد حقیقت برای دامنه‌ها پایگاه‌داده Controller است که از طریق سرویس Site (Laravel + MySQL) مدیریت می‌شود.

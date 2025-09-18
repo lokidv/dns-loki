@@ -266,8 +266,6 @@ class ConfigOut(BaseModel):
     ui_auth_enabled: bool = False
     internal_auth_enabled: bool = False
     internal_auth_source: Optional[str] = "none"
-    # New: scanner mode configuration
-    scanner: Optional[dict] = None
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -280,13 +278,6 @@ class FlagsPayload(BaseModel):
     enforce_dns_clients: Optional[bool] = None
     enforce_proxy_clients: Optional[bool] = None
     enforce_token_on_reads: Optional[bool] = None
-
-
-# ===== Scanner mode =====
-class ScannerStartPayload(BaseModel):
-    clients: Optional[List[IPvAnyAddress]] = None
-    duration_sec: int = 120
-    block_quic: bool = True
 
 
 class ProvisionRequest(BaseModel):
@@ -326,7 +317,6 @@ def _load_state():
             "enforce_dns_clients": True,
             "enforce_proxy_clients": False,
             "domains": [],
-            "scanner": {"active": False, "expires_ts": 0, "clients": [], "block_quic": True},
         }
         with open(STATE_PATH, "w") as f:
             json.dump(st, f)
@@ -343,7 +333,6 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
-    st.setdefault("scanner", {"active": False, "expires_ts": 0, "clients": [], "block_quic": True})
     _save_state(st)
     return st
 
@@ -363,54 +352,6 @@ def get_config():
         st["internal_auth_enabled"] = bool(tok)
         st["internal_auth_source"] = src
         return st
-
-
-@app.get("/v1/scanner")
-def scanner_status():
-    with LOCK:
-        st = _load_state()
-        sc = st.get("scanner") or {}
-        now = time.time()
-        remaining = max(0, int((sc.get("expires_ts") or 0) - now)) if sc.get("active") else 0
-        return {
-            "active": bool(sc.get("active", False)),
-            "expires_ts": sc.get("expires_ts", 0),
-            "remaining_sec": remaining,
-            "clients": sc.get("clients", []),
-            "block_quic": bool(sc.get("block_quic", True)),
-        }
-
-
-@app.post("/v1/scanner/start", dependencies=[Depends(require_internal)])
-def scanner_start(p: ScannerStartPayload):
-    dur = int(p.duration_sec or 120)
-    if dur < 10:
-        dur = 10
-    if dur > 3600:
-        dur = 3600
-    with LOCK:
-        st = _load_state()
-        now = time.time()
-        st["scanner"] = {
-            "active": True,
-            "expires_ts": now + dur,
-            "clients": [str(ip) for ip in (p.clients or [])],
-            "block_quic": bool(p.block_quic),
-        }
-        _save_state(st)
-        return {"ok": True, "scanner": st["scanner"]}
-
-
-@app.post("/v1/scanner/stop", dependencies=[Depends(require_internal)])
-def scanner_stop():
-    with LOCK:
-        st = _load_state()
-        sc = st.get("scanner") or {}
-        sc["active"] = False
-        sc["expires_ts"] = 0
-        st["scanner"] = sc
-        _save_state(st)
-        return {"ok": True, "scanner": sc}
 
 
 @app.get("/v1/clients", response_model=List[Client])
@@ -1348,7 +1289,7 @@ def get_code_archive(repo: Optional[str] = None, branch: Optional[str] = None):
 # ===== DNS Query Telemetry (Agent → Controller) =====
 class TelemetryRowIn(BaseModel):
     domain: str
-    client_ip: Optional[IPvAnyAddress] = None
+    client_ip: IPvAnyAddress
     targeted: Optional[bool] = None
     count: int = 1
 
@@ -1448,7 +1389,7 @@ def ingest_dns_queries(payload: TelemetryPayloadIn):
                     "ts": base_ts,
                     "node_ip": node_ip_s,
                     "domain": _normalize_domain(r.domain),
-                    "client_ip": (str(r.client_ip) if r.client_ip is not None else ""),
+                    "client_ip": str(r.client_ip),
                     "targeted": (bool(r.targeted) if r.targeted is not None else None),
                     "count": int(r.count or 1),
                 }
@@ -1504,7 +1445,7 @@ def telemetry_top(since: Optional[float] = None, non_targeted: Optional[bool] = 
         for e in items:
             dom = _normalize_domain(e.get("domain", ""))
             cip = str(e.get("client_ip"))
-            if not dom:
+            if not dom or not cip:
                 continue
             if non_targeted and not (e.get("targeted") is False):
                 # only include explicitly non-targeted entries when requested
@@ -1514,11 +1455,10 @@ def telemetry_top(since: Optional[float] = None, non_targeted: Optional[bool] = 
             cnt = int(e.get("count", 1) or 1)
             ts_val = float(e.get("ts", 0))
             if not cur:
-                agg[key] = {"domain": dom, "total": cnt, "clients": ({cip} if cip else set()), "first_seen": ts_val, "last_seen": ts_val}
+                agg[key] = {"domain": dom, "total": cnt, "clients": {cip}, "first_seen": ts_val, "last_seen": ts_val}
             else:
                 cur["total"] += cnt
-                if cip:
-                    cur["clients"].add(cip)
+                cur["clients"].add(cip)
                 if ts_val < cur["first_seen"]:
                     cur["first_seen"] = ts_val
                 if ts_val > cur["last_seen"]:

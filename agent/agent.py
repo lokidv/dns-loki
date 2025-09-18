@@ -12,8 +12,6 @@ from pathlib import Path
 import tempfile
 import zipfile
 from urllib.request import urlopen
-import threading
-import collections
 
 DEF_CORE_DNS_DIR = "/opt/dns-proxy/docker/dns"
 DEF_PROXY_DIR = "/opt/dns-proxy/docker/proxy"
@@ -22,131 +20,6 @@ DOMAINS_DIR = f"{WORK_DIR}/domains"
 LAST_VER_FILE = f"{WORK_DIR}/agent/last_agents_version"
 LOG_FILE = f"{WORK_DIR}/agent/agent.log"
 TELE_LAST_FILE = f"{WORK_DIR}/agent/telemetry_last_ts"
-TELE_SNI_LAST_FILE = f"{WORK_DIR}/agent/telemetry_sni_last_ts"
-
-# Live DNS sniffer globals
-SNIFF_RING = collections.deque(maxlen=5000)  # (ts, client_ip, domain, qtype)
-SNIFF_LOCK = threading.Lock()
-SNIFF_THR = None
-SNIFF_RUNNING = False
-# Cache for mapping origin IPs (upstream servers) to last seen domain from sniproxy traffic.
-# key: origin IPv4 string -> value: (domain, ts)
-ORIGIP_LAST_DOMAIN = {}
-
-
-def _ensure_dns_sniffer_running():
-    """Start a background tcpdump-based DNS sniffer if available and not running."""
-    global SNIFF_THR, SNIFF_RUNNING
-    if SNIFF_RUNNING:
-        return
-    if not shutil.which("tcpdump"):
-        try:
-            log("sniffer: tcpdump not found; live DNS sniff disabled")
-        except Exception:
-            pass
-        return
-    def _loop():
-        global SNIFF_RUNNING
-        SNIFF_RUNNING = True
-        try:
-            # Capture UDP/TCP:53 queries on any iface; -l for line-buffered output
-            # Note: do not use '-tt' to keep output simple; we add our own ts
-            proc = subprocess.Popen(
-                ["tcpdump", "-i", "any", "-l", "-n", "-vvv", "-s", "0", "(udp or tcp)", "and", "port", "53"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-            if not proc or not proc.stdout:
-                return
-            for ln in proc.stdout:
-                if not ln:
-                    continue
-                # Only consider lines that look like queries (contain '?')
-                if '?' not in ln:
-                    continue
-                cip, dom, qtype = _parse_tcpdump_dns_line(ln)
-                if not cip or not dom:
-                    continue
-                if dom.endswith('.arpa'):
-                    continue
-                with SNIFF_LOCK:
-                    SNIFF_RING.append((time.time(), str(cip), str(dom).lower(), (qtype or '').upper()))
-        except Exception as e:
-            try:
-                log(f"sniffer: exception -> {e}")
-            except Exception:
-                pass
-        finally:
-            SNIFF_RUNNING = False
-    try:
-        SNIFF_THR = threading.Thread(target=_loop, name="dns-sniffer", daemon=True)
-        SNIFF_THR.start()
-        try:
-            log("sniffer: started background tcpdump thread")
-        except Exception:
-            pass
-    except Exception:
-        SNIFF_RUNNING = False
-
-
-def _sniff_rows_since(ts_from: float):
-    """Return list of (client_ip, domain, qtype) from ring with ts >= ts_from."""
-    rows = []
-    try:
-        with SNIFF_LOCK:
-            for (ts, cip, dom, qt) in list(SNIFF_RING):
-                if ts >= ts_from:
-                    rows.append((cip, dom, qt))
-    except Exception:
-        return []
-    return rows
-
-
-def nft_ensure_scanner_quic_drop_rules():
-    """Ensure nftables has drop rules for UDP/443 from @scanner_clients in input and forward chains.
-    Rules are safe to keep permanently since empty set means no effect.
-    """
-    try:
-        # Ensure set exists before referencing in rules
-        nft_ensure_set("scanner_clients")
-        # Ensure table exists (it should due to other uses)
-        run("nft list table inet filter", check=False)
-        # Check and add for input chain
-        res_in = run("nft list chain inet filter input", check=False)
-        txt_in = res_in.stdout.decode(errors="ignore") if getattr(res_in, 'stdout', None) else ""
-        if "scanner_clients" not in txt_in:
-            run("nft add rule inet filter input udp dport 443 ip saddr @scanner_clients counter drop", check=False)
-        # Check and add for forward chain
-        res_fw = run("nft list chain inet filter forward", check=False)
-        txt_fw = res_fw.stdout.decode(errors="ignore") if getattr(res_fw, 'stdout', None) else ""
-        if "scanner_clients" not in txt_fw:
-            run("nft add rule inet filter forward udp dport 443 ip saddr @scanner_clients counter drop", check=False)
-    except Exception:
-        # best-effort; log but do not raise
-        try:
-            log("nft: failed ensuring scanner QUIC drop rules (best-effort)")
-        except Exception:
-            pass
-    return None
-
-
-def _last_dns_domain_for_client(cip: str, window_sec: float, now_ts: float):
-    """Return most recent DNS domain queried by client ip within window_sec, else None."""
-    if not cip:
-        return None
-    try:
-        with SNIFF_LOCK:
-            for (ts, c, dom, qt) in reversed(list(SNIFF_RING)):
-                if now_ts - ts > window_sec:
-                    break
-                if c == cip and dom:
-                    return dom
-    except Exception:
-        return None
-    return None
 
 
 def run(cmd, check=True):
@@ -357,143 +230,6 @@ def fetch_domains_from_api(controller_url: str, headers=None):
     return []
 
 
-def _parse_sniproxy_access_log_line(line: str):
-    """Parse a sniproxy access_log stdout line and extract (client_ip, hostname).
-    Tries common patterns like "<client_ip>:<port> -> <host>[:port]" or mentions of SNI.
-    Returns (client_ip, domain) or (None, None).
-    """
-    try:
-        s = (line or "").strip()
-        if not s:
-            return None, None
-        # First, try pattern with explicit arrow
-        m = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?\s*->\s*([A-Za-z0-9.-]*[A-Za-z][A-Za-z0-9.-]*\.[A-Za-z]{2,})", s)
-        if m:
-            return m.group(1), m.group(2).strip('.')
-        # Try to extract SNI host token
-        m2 = re.search(r"SNI[^A-Za-z0-9.-]*([A-Za-z0-9.-]*[A-Za-z][A-Za-z0-9.-]*\.[A-Za-z]{2,})", s, re.I)
-        if m2:
-            # Try also to get a client IP earlier in the line
-            m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?", s)
-            return (m_ip.group(1) if m_ip else None), m2.group(1).strip('.')
-        # Fallback: pick first domain-looking token in line
-        m3 = re.search(r"\b([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\b", s)
-        if m3:
-            m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)(?::\d+)?", s)
-            return (m_ip.group(1) if m_ip else None), m3.group(1).strip('.')
-    except Exception:
-        pass
-    return None, None
-
-
-def _collect_sni_telemetry(domains_rules, last_ts: float):
-    """Collect SNI/HTTP Hostnames from sniproxy container logs since last_ts.
-    Returns (rows: list[dict], new_ts: float). Rows format compatible with DNS telemetry: {domain, client_ip, targeted, count}.
-    """
-    now_ts = time.time()
-    iso = _iso8601(last_ts)
-    lines = []
-    # Resolve sniproxy container id
-    try:
-        cid = None
-        try:
-            resid = run(f"docker compose -f {DEF_PROXY_DIR}/docker-compose.yml ps -q sniproxy", check=False)
-            if resid.returncode == 0 and resid.stdout and resid.stdout.strip():
-                cid = resid.stdout.decode(errors='ignore').strip() if isinstance(resid.stdout, (bytes, bytearray)) else str(resid.stdout).strip()
-        except Exception:
-            cid = None
-        if not cid:
-            # Fallback: search by name
-            resls = run("docker ps --format '{{.ID}} {{.Names}}'", check=False)
-            if resls.returncode == 0 and resls.stdout:
-                txt = resls.stdout.decode(errors='ignore') if isinstance(resls.stdout, (bytes, bytearray)) else str(resls.stdout)
-                for l in txt.splitlines():
-                    parts = l.split(None, 1)
-                    if len(parts) == 2 and 'sniproxy' in parts[1].lower():
-                        cid = parts[0].strip()
-                        break
-        if cid:
-            res = run(f"docker logs --since '{iso}' {cid}", check=False)
-            if res.returncode == 0 and res.stdout:
-                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
-                lines = [l for l in txt.splitlines() if l.strip()]
-    except Exception:
-        lines = []
-    # Parse
-    pairs = []  # (client_ip, domain)
-    # Precompile summary regex: "CIP:port -> PROXY:port -> ORIG:port [domain] ..."
-    re_summary = re.compile(r"(?P<cip>\d+\.\d+\.\d+\.\d+):\d+\s*->\s*\d+\.\d+\.\d+\.\d+:\d+\s*->\s*(?P<orig>(?:\d+\.\d+\.\d+\.\d+|NONE))(?::\d+)?\s*\[(?P<dom>[^\]]*)\]", re.I)
-    now_ts = time.time()
-    for ln in lines:
-        s = (ln or "").strip()
-        if not s:
-            continue
-        # Skip sniproxy config parsing and resolver noise
-        if s.startswith("Parsed ") or s.startswith("resolv:"):
-            continue
-        # Try detailed summary pattern first (most reliable)
-        ms = re_summary.search(s)
-        if ms:
-            cip = ms.group("cip")
-            orig = ms.group("orig")
-            dom = (ms.group("dom") or "").strip().strip('.').lower()
-            if dom:
-                # Update origin->domain cache and record pair
-                if orig and orig.upper() != "NONE" and re.match(r"^\d+\.\d+\.\d+\.\d+$", orig):
-                    ORIGIP_LAST_DOMAIN[orig] = (dom, now_ts)
-                if not dom.endswith('.arpa'):
-                    pairs.append((cip or '', dom))
-                continue
-            # No domain in summary -> try to infer
-            inferred = None
-            if orig and orig.upper() != "NONE" and re.match(r"^\d+\.\d+\.\d+\.\d+$", orig):
-                t = ORIGIP_LAST_DOMAIN.get(orig)
-                if t and (now_ts - t[1] <= 600):
-                    inferred = t[0]
-            if not inferred:
-                inferred = _last_dns_domain_for_client(cip, window_sec=5.0, now_ts=now_ts)
-            if inferred and not inferred.endswith('.arpa'):
-                pairs.append((cip or '', inferred))
-            continue
-        # Handle lines indicating no SNI/TLS; try to infer by client IP from recent DNS queries
-        if (
-            "did not include a hostname" in s
-            or "did not begin with TLS handshake" in s
-            or "Unable to parse request" in s
-        ):
-            mcip = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", s)
-            cip = mcip.group(1) if mcip else None
-            inferred = _last_dns_domain_for_client(cip, window_sec=5.0, now_ts=now_ts)
-            if inferred and not inferred.endswith('.arpa'):
-                pairs.append((cip or '', inferred))
-            continue
-        # Fallback: generic parser (handles bracketed [domain] too)
-        cip, host = _parse_sniproxy_access_log_line(s)
-        if not host:
-            continue
-        d = host.lower().strip('.')
-        if d.endswith('.arpa'):
-            continue
-        pairs.append((cip or '', d))
-    # Aggregate counts by (domain, client_ip)
-    agg = {}
-    for (cip, dom) in pairs:
-        key = (dom, cip)
-        agg[key] = agg.get(key, 0) + 1
-    out_rows = []
-    for (dom, cip), cnt in agg.items():
-        out_rows.append({
-            "domain": dom,
-            "client_ip": cip,
-            "targeted": _domain_targeted(dom, domains_rules),
-            "count": int(cnt),
-        })
-    try:
-        log(f"sni-telemetry: parsed lines={len(lines)} unique_pairs={len(agg)}")
-    except Exception:
-        pass
-    return out_rows, now_ts
-
 def build_regex_from_domains(domains):
     # Convert list like ["amd.com", "*.amd.com"] into a regex alternation
     cleaned = []
@@ -512,28 +248,7 @@ def render_coredns_targets(domains, healthy_ips):
     ttl = 60
     for ip in healthy_ips:
         lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
-    lines.append("}")
-    # Block modern alias/hint records that may instruct clients to bypass A answers
-    lines.append("template IN HTTPS {")
-    lines.append(f"  match {regex}")
-    lines.append("  rcode NOERROR")
-    lines.append("}")
-    lines.append("template IN SVCB {")
-    lines.append(f"  match {regex}")
-    lines.append("  rcode NOERROR")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
-
-
-def render_scanner_targets(healthy_ips):
-    """Catch-all CoreDNS template to direct ALL A queries to selected proxy IPs.
-    This is used only during Scanner Mode windows.
-    """
-    lines = ["template IN A {", r"  match ^(.*)\\.$"]
-    ttl = 30
-    for ip in healthy_ips:
-        lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
-    # no fallthrough: we want to answer everything during scan
+    lines.append("  fallthrough")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -567,13 +282,6 @@ def render_v6block(domains):
   match {regex}
   rcode NOERROR
 }}
-"""
-
-def render_scanner_v6block():
-    return """template IN AAAA {
-  match ^(.*)\.$
-  rcode NOERROR
-}
 """
 
 def render_coredns_acl(dns_clients, enforce: bool):
@@ -799,12 +507,7 @@ def _iso8601(ts: float) -> str:
 def _read_last_ts(path: str, default_delta: float = 15.0) -> float:
     try:
         if Path(path).exists():
-            val = float(Path(path).read_text().strip())
-            now = time.time()
-            # Clamp to now - default_delta if file contains a future timestamp
-            if val > now:
-                return now - default_delta
-            return val
+            return float(Path(path).read_text().strip())
     except Exception:
         pass
     # default: a short lookback to avoid huge log windows
@@ -829,92 +532,24 @@ def _parse_coredns_log_line(line: str):
         txt = line.strip()
         if not txt:
             return None, None, None
-        # extract client ip (support IPv4:port and [IPv6]:port formats)
+        # extract client ip
         m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", txt)
-        if m_ip:
-            cip = m_ip.group(1)
-        else:
-            m6 = re.search(r"\[([0-9a-fA-F:]+)\]:(\d+)", txt)
-            if not m6:
-                return None, None, None
-            cip = m6.group(1)
+        if not m_ip:
+            return None, None, None
+        cip = m_ip.group(1)
         # extract quoted query section
         m_q = re.search(r'"([^"]+)"', txt)
-        if m_q:
-            q = m_q.group(1)
-            parts = q.split()
-            if len(parts) >= 3:
-                qtype = parts[0]
-                domain = parts[2].rstrip('.')
-                return cip, domain.lower(), qtype
-        # Fallbacks when format varies: try to locate a likely domain token
-        m_dom = re.search(r'\s([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)\.?\s', txt)
-        if m_dom:
-            dom = m_dom.group(1).rstrip('.')
-            return cip, dom.lower(), None
-        return cip, None, None
-    except Exception:
-        return None, None, None
-
-
-def _parse_tcpdump_dns_line(line: str):
-    """Parse a tcpdump -vvv -n line for DNS query attempts.
-    Returns (client_ip, domain, qtype) or (None, None, None).
-    Example:
-      IP 192.0.2.3.56512 > 10.0.0.1.53: 39238+ A? example.com. (28)
-      IP6 2001:db8::1.56512 > 10.0.0.1.53: 39238+ HTTPS? example.com. (65)
-    """
-    try:
-        s = line.strip()
-        if not s:
-            return None, None, None
-        m_ep = re.search(r"^(?:IP6?|IP)\s+([^\s>]+)\s+>\s+[^\s:]+:", s)
-        if not m_ep:
-            return None, None, None
-        ep = m_ep.group(1)
-        # client endpoint looks like 1.2.3.4.12345 or 2001:db8::1.12345
-        if '.' in ep:
-            cip = ep.rsplit('.', 1)[0]
-        else:
-            cip = ep  # best effort
-        m_q = re.search(r"\s([A-Z0-9]+)\?\s+([A-Za-z0-9_.-]+)\.?\s", s)
         if not m_q:
-            return None, None, None
-        qtype = m_q.group(1).upper()
-        dom = m_q.group(2).strip('.').lower()
-        return cip, dom, qtype
+            return cip, None, None
+        q = m_q.group(1)
+        parts = q.split()
+        if len(parts) < 3:
+            return cip, None, None
+        qtype = parts[0]
+        domain = parts[2].rstrip('.')
+        return cip, domain.lower(), qtype
     except Exception:
         return None, None, None
-
-
-def _collect_live_dns_sniff(timeout_seconds: int = 2):
-    """Best-effort live capture of DNS queries using tcpdump for a short time.
-    Requires tcpdump to be installed and sufficient privileges. Returns list of (client_ip, domain, qtype).
-    """
-    try:
-        cmd = f"timeout {int(timeout_seconds)} tcpdump -i any -l -n -vvv -s 0 udp port 53"
-        res = run(cmd, check=False)
-        if getattr(res, 'stdout', None):
-            try:
-                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
-            except Exception:
-                txt = str(res.stdout)
-            rows = []
-            for ln in txt.splitlines():
-                # Only consider query lines, which include '?'
-                if '?' not in ln:
-                    continue
-                cip, dom, qtype = _parse_tcpdump_dns_line(ln)
-                if not cip or not dom:
-                    continue
-                # Skip reverse lookups noise
-                if dom.endswith('.arpa'):
-                    continue
-                rows.append((cip, dom, qtype or ''))
-            return rows
-    except Exception:
-        pass
-    return []
 
 
 def _domain_targeted(domain: str, rules) -> bool:
@@ -932,60 +567,23 @@ def _domain_targeted(domain: str, rules) -> bool:
 
 
 def _collect_dns_telemetry(domains_rules, last_ts: float):
-    """Collect CoreDNS logs since last_ts using docker/journald logs; return rows list and new_ts.
+    """Collect CoreDNS logs since last_ts using docker logs; return rows list and new_ts.
     rows: list of (client_ip, domain, qtype)
-    Capture DNS query attempts broadly (A/AAAA plus modern types like HTTPS/SVCB/SRV/CNAME)
-    to ensure blocked domains still show up even when upstream resolution fails.
     """
     now_ts = time.time()
     iso = _iso8601(last_ts)
     lines = []
-    # try docker logs first (resolve actual container id/name used by compose)
+    # try docker logs first (container name is 'coredns')
     try:
-        cid = None
-        # Preferred: docker compose ps -q coredns
-        try:
-            resid = run(f"docker compose -f {DEF_CORE_DNS_DIR}/docker-compose.yml ps -q coredns", check=False)
-            if resid.returncode == 0 and resid.stdout and resid.stdout.strip():
-                cid = resid.stdout.decode(errors='ignore').strip() if isinstance(resid.stdout, (bytes, bytearray)) else str(resid.stdout).strip()
-        except Exception:
-            cid = None
-        # Fallback: find any running container with name containing 'coredns'
-        if not cid:
+        res = run(f"docker logs --since '{iso}' coredns", check=False)
+        if res.returncode == 0 and res.stdout:
             try:
-                resls = run("docker ps --format '{{.ID}} {{.Names}}'", check=False)
-                if resls.returncode == 0 and resls.stdout:
-                    txt = resls.stdout.decode(errors='ignore') if isinstance(resls.stdout, (bytes, bytearray)) else str(resls.stdout)
-                    for line in txt.splitlines():
-                        parts = line.split(None, 1)
-                        if len(parts) == 2:
-                            _id, _name = parts[0].strip(), parts[1].strip()
-                            if 'coredns' in _name.lower():
-                                cid = _id
-                                break
+                txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
             except Exception:
-                cid = None
-        if cid:
-            res = run(f"docker logs --since '{iso}' {cid}", check=False)
-            if res.returncode == 0 and res.stdout:
-                try:
-                    txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
-                except Exception:
-                    txt = str(res.stdout)
-                cand = [l for l in txt.splitlines() if l.strip()]
-                if cand:
-                    lines = cand
-        else:
-            # As a last try, attempt the bare name 'coredns'
-            res = run(f"docker logs --since '{iso}' coredns", check=False)
-            if res.returncode == 0 and res.stdout:
-                try:
-                    txt = res.stdout.decode(errors='ignore') if isinstance(res.stdout, (bytes, bytearray)) else str(res.stdout)
-                except Exception:
-                    txt = str(res.stdout)
-                cand = [l for l in txt.splitlines() if l.strip()]
-                if cand:
-                    lines = cand
+                txt = str(res.stdout)
+            cand = [l for l in txt.splitlines() if l.strip()]
+            if cand:
+                lines = cand
     except Exception:
         lines = []
     # fallback: read from journald when running native CoreDNS services
@@ -1009,16 +607,10 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
         cip, dom, qtype = _parse_coredns_log_line(ln)
         if not cip or not dom:
             continue
-        # filter out PTR/reverse and infrastructure noise to avoid flooding
-        dlow = (dom or "").lower()
-        if dlow.endswith(".arpa"):
+        # Only consider A/AAAA to match our targeting model
+        if qtype and qtype not in ("A", "AAAA"):
             continue
-        # Keep all other types (we want to see attempts regardless of success/type)
-        rows.append((cip, dlow, (qtype or "").upper()))
-    # Merge in rows from continuous sniffer since last_ts, if available
-    sniff_rows_ring = _sniff_rows_since(last_ts)
-    if sniff_rows_ring:
-        rows.extend(sniff_rows_ring)
+        rows.append((cip, dom, qtype or ""))
     # aggregate by (domain, client_ip)
     agg = {}
     for (cip, dom, _qt) in rows:
@@ -1033,10 +625,6 @@ def _collect_dns_telemetry(domains_rules, last_ts: float):
             "targeted": _domain_targeted(dom, domains_rules),
             "count": int(cnt),
         })
-    try:
-        log(f"telemetry: parsed lines={len(lines)} rows_combined={len(rows)} unique_pairs={len(agg)}")
-    except Exception:
-        pass
     return out_rows, now_ts
 
 
@@ -1173,11 +761,6 @@ def main():
 
         healthy = []
         if role == "dns":
-            # Ensure live sniffer is running to capture query attempts immediately
-            try:
-                _ensure_dns_sniffer_running()
-            except Exception:
-                pass
             log(f"dns: applying policy -> enforce={enforce_dns}")
             apply_dns_policy(enforce_dns)
             # Update nft set of allowed dns clients
@@ -1203,26 +786,8 @@ def main():
             # Fallback: اگر سالمی نبود، همه را استفاده کن
             selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
             # Render CoreDNS override files
-            # Scanner mode: when active, override targets/v6block with catch-all, and set nft scanner clients
-            sc = conf.get("scanner") or {}
-            active = bool(sc.get("active", False))
-            not_expired = (time.time() < float(sc.get("expires_ts", 0)))
-            sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
-            if active and not_expired:
-                log(f"scanner: ACTIVE - applying catch-all for clients={sc_clients} (block_quic={bool(sc.get('block_quic', True))})")
-                # Update nft set for scanner clients and ensure QUIC drop rules
-                nft_ensure_set("scanner_clients")
-                nft_replace_set("scanner_clients", sc_clients)
-                if bool(sc.get("block_quic", True)):
-                    nft_ensure_scanner_quic_drop_rules()
-                targets = render_scanner_targets(selected)
-                v6blk = render_scanner_v6block()
-            else:
-                # Clear scanner set so drop rules have no effect
-                nft_ensure_set("scanner_clients")
-                nft_replace_set("scanner_clients", [])
-                targets = render_coredns_targets(domains, selected)
-                v6blk = render_v6block(domains)
+            targets = render_coredns_targets(domains, selected)
+            v6blk = render_v6block(domains)
             acltxt = render_coredns_acl(dns_clients, enforce_dns)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
@@ -1253,36 +818,15 @@ def main():
             # Update nft set of allowed proxy clients
             if enforce_proxy:
                 # Only allow Iran DNS nodes (required), plus any explicit proxy-scope clients (if defined)
-                # When scanner is active, also allow scanner clients temporarily.
-                sc = conf.get("scanner") or {}
-                active = bool(sc.get("active", False))
-                not_expired = (time.time() < float(sc.get("expires_ts", 0)))
-                sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
-                base_clients = sorted(set(proxy_clients + dns_node_ips))
-                allowed_proxy_clients = (sorted(set(base_clients + sc_clients)) if (active and not_expired) else base_clients)
+                allowed_proxy_clients = sorted(set(proxy_clients + dns_node_ips))
                 ipv4_allowed = only_ipv4(allowed_proxy_clients)
                 log(f"proxy: enforcement enabled, updating allowlist with {len(ipv4_allowed)} clients -> {ipv4_allowed}")
-                log(f"proxy: allowlist breakdown -> proxy_clients={proxy_clients}, dns_nodes={dns_node_ips}, scanner_clients={(sc_clients if (active and not_expired) else [])}")
+                log(f"proxy: allowlist breakdown -> proxy_clients={proxy_clients}, dns_nodes={dns_node_ips}")
                 nft_replace_set("allow_proxy_clients", ipv4_allowed)
             else:
                 # When enforcement is disabled, clear the set to reflect runtime state
                 log("proxy: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_proxy_clients", [])
-
-            # Scanner mode on proxy: ensure scanner_clients set and (optionally) drop UDP/443 from those clients
-            sc = conf.get("scanner") or {}
-            active = bool(sc.get("active", False))
-            not_expired = (time.time() < float(sc.get("expires_ts", 0)))
-            sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
-            nft_ensure_set("scanner_clients")
-            if active and not_expired and sc_clients:
-                log(f"proxy: scanner ACTIVE - updating scanner_clients set -> {sc_clients}")
-                nft_replace_set("scanner_clients", sc_clients)
-                if bool(sc.get("block_quic", True)):
-                    nft_ensure_scanner_quic_drop_rules()
-            else:
-                # empty set disables effect of drop rules
-                nft_replace_set("scanner_clients", [])
             # Render sniproxy.conf from template
             conf_txt = render_sniproxy_conf(domains)
             out_path = Path(DEF_PROXY_DIR) / "sniproxy.conf"
@@ -1302,39 +846,6 @@ def main():
                         restart_sniproxy()
                     else:
                         log("sniproxy: start skipped; docker not ready")
-
-            # Collect and send SNI telemetry from sniproxy logs (best-effort)
-            try:
-                last_ts_sni = _read_last_ts(TELE_SNI_LAST_FILE)
-                sni_rows, new_ts_sni = _collect_sni_telemetry(domains, last_ts_sni)
-                if sni_rows:
-                    payload = {"node_ip": my_ip, "ts": new_ts_sni, "rows": sni_rows}
-                    try:
-                        requests.post(f"{controller_url}/v1/telemetry/dns-queries", json=payload, timeout=5, headers=headers)
-                        log(f"sni-telemetry: sent {len(sni_rows)} rows")
-                    except Exception as e:
-                        log(f"sni-telemetry: post failed -> {e}")
-                _write_last_ts(TELE_SNI_LAST_FILE, new_ts_sni)
-            except Exception as e:
-                log(f"sni-telemetry: failed -> {e}")
-
-        # If this node is not marked as proxy but proxy enforcement is ON and sniproxy is present,
-        # still run SNI telemetry collection here to support combined-role deployments.
-        if role != "proxy" and enforce_proxy:
-            try:
-                if _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy"):
-                    last_ts_sni = _read_last_ts(TELE_SNI_LAST_FILE)
-                    sni_rows, new_ts_sni = _collect_sni_telemetry(domains, last_ts_sni)
-                    if sni_rows:
-                        payload = {"node_ip": my_ip, "ts": new_ts_sni, "rows": sni_rows}
-                        try:
-                            requests.post(f"{controller_url}/v1/telemetry/dns-queries", json=payload, timeout=5, headers=headers)
-                            log(f"sni-telemetry: sent {len(sni_rows)} rows (dns-role)")
-                        except Exception as e:
-                            log(f"sni-telemetry: post failed (dns-role) -> {e}")
-                    _write_last_ts(TELE_SNI_LAST_FILE, new_ts_sni)
-            except Exception as e:
-                log(f"sni-telemetry: failed (dns-role) -> {e}")
 
         # Build diagnostics after applying configs
         # Gather runtime nft set elements (best-effort)
