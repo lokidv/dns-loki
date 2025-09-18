@@ -260,6 +260,33 @@
       <div class="muted" style="margin-top:8px;">
         در حالت اسکن، پاسخ A برای کل دامنه‌ها به پروکسی برگردانده می‌شود و برای کلاینت‌های انتخاب‌شده، UDP/443 (QUIC) مسدود می‌گردد تا SNI/Host به‌صورت کامل لاگ شود.
       </div>
+      <div class="divider" style="margin-top:10px;"></div>
+      <div class="section-head">
+        <h2>لاگ‌های زنده اسکن</h2>
+        <div class="toolbar">
+          <label class="muted" style="display:flex; align-items:center; gap:6px;">بازه (دقیقه): <input id="scanLogSinceMins" type="number" min="1" value="15" style="width:90px;" /></label>
+          <label class="muted" style="display:flex; align-items:center; gap:6px;"><input id="scanLogAuto" type="checkbox" checked /> خودکار</label>
+          <button id="btnScanLogRefresh">رفرش</button>
+        </div>
+      </div>
+      <div class="muted" style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+        <div id="scanLogCount">—</div>
+        <div id="scanLogLoading" style="display:none;">در حال بارگذاری...</div>
+      </div>
+      <div style="max-height:320px; overflow:auto; border:1px solid var(--border); border-radius:10px;">
+        <table class="table-sticky" style="margin-top:0; width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th>زمان</th>
+              <th>کلاینت</th>
+              <th>دامنه</th>
+              <th>هدف‌دار؟</th>
+              <th>تعداد</th>
+            </tr>
+          </thead>
+          <tbody id="scanLogBody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -758,6 +785,8 @@ document.getElementById('btnScanStart')?.addEventListener('click', async ()=>{
     const t = await r.text();
     if(!r.ok){ alert('خطا در شروع اسکن: ' + t); return; }
     await loadScannerStatus();
+    await loadScannerLogs();
+    startScanLogTimerIfNeeded();
     alert('اسکن فعال شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
 });
@@ -768,8 +797,74 @@ document.getElementById('btnScanStop')?.addEventListener('click', async ()=>{
     const t = await r.text();
     if(!r.ok){ alert('خطا در توقف اسکن: ' + t); return; }
     await loadScannerStatus();
+    await loadScannerLogs();
+    startScanLogTimerIfNeeded();
     alert('اسکن متوقف شد.');
   }catch(e){ alert('خطا: ' + (e?.message || e)); }
+});
+
+// ===== Live Scanner Logs (filtered by scanner clients) =====
+function renderScannerLogs(items){
+  try{
+    const body = document.getElementById('scanLogBody'); if(!body) return;
+    body.innerHTML = '';
+    const cntEl = document.getElementById('scanLogCount');
+    (items || []).forEach(e => {
+      const targeted = (e.targeted===true) ? '<span class="status ok">هدف‌دار</span>' : (e.targeted===false ? '<span class="status warn">غیرهدف‌دار</span>' : '—');
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td title="${fmtTime(e.ts)}">${fmtAgo(e.ts||0)}</td>
+        <td class="cell-ip"><code>${e.client_ip||''}</code></td>
+        <td><code>${e.domain||''}</code></td>
+        <td>${targeted}</td>
+        <td>${e.count||1}</td>
+      `;
+      body.appendChild(tr);
+    });
+    if(cntEl) cntEl.textContent = `تعداد: ${(items||[]).length}`;
+  }catch(_){ /* ignore */ }
+}
+
+async function loadScannerLogs(){
+  const loading = document.getElementById('scanLogLoading'); if(loading) loading.style.display = 'inline';
+  try{
+    // determine clients to filter: prefer active scanner clients, otherwise use typed input
+    const s = await (await api('/v1/scanner')).json().catch(()=>({}));
+    let filterClients = [];
+    if(s && s.active && Array.isArray(s.clients) && s.clients.length){
+      filterClients = s.clients.map(x => String(x));
+    } else {
+      filterClients = parseScannerClients();
+    }
+    const mins = parseInt(document.getElementById('scanLogSinceMins')?.value || '15', 10) || 15;
+    const since = Math.floor(Date.now()/1000) - (mins * 60);
+    const r = await api(`/v1/telemetry/dns-queries?since=${encodeURIComponent(since)}&limit=1000`);
+    if(!r.ok){ renderScannerLogs([]); return; }
+    const j = await r.json();
+    let items = Array.isArray(j.items) ? j.items : [];
+    if(Array.isArray(filterClients) && filterClients.length){
+      const set = new Set(filterClients);
+      items = items.filter(e => set.has(String(e.client_ip||'')));
+    }
+    // newest first already from API; keep as-is
+    renderScannerLogs(items);
+  }catch(_){ renderScannerLogs([]); }
+  finally{ if(loading) loading.style.display = 'none'; }
+}
+
+function startScanLogTimerIfNeeded(){
+  try{ if(APP.scanLogTimer){ clearInterval(APP.scanLogTimer); APP.scanLogTimer = null; } }catch(_){ }
+  const auto = !!document.getElementById('scanLogAuto')?.checked;
+  if(APP.activeView === 'home' && auto){
+    APP.scanLogTimer = setInterval(() => { loadScannerLogs(); }, 5000);
+  }
+}
+
+document.getElementById('btnScanLogRefresh')?.addEventListener('click', async ()=>{
+  await loadScannerLogs();
+});
+document.getElementById('scanLogAuto')?.addEventListener('change', ()=>{
+  startScanLogTimerIfNeeded();
 });
 
 
@@ -852,6 +947,8 @@ async function refreshActive(){
       loadConfig(), loadDomains(), loadClients(), loadNodes(), loadUiSettings(), loadScannerStatus(),
     ]);
     await loadServerTokenStatus();
+    await loadScannerLogs();
+    startScanLogTimerIfNeeded();
   } else {
     await Promise.all([
       loadTelemetrySettings(), loadTelemetryTop(), loadTelemetryRecents()
@@ -866,6 +963,8 @@ function switchView(v){
   if(APP.activeView === 'history') loadHistoryFilters();
   // Lazy-load data for the active view
   refreshActive();
+  // Manage scanner logs timer when switching views
+  startScanLogTimerIfNeeded();
 }
 
 // moved from <style>: load UI settings from controller
