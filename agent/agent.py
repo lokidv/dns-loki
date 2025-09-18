@@ -105,6 +105,34 @@ def _sniff_rows_since(ts_from: float):
     return rows
 
 
+def nft_ensure_scanner_quic_drop_rules():
+    """Ensure nftables has drop rules for UDP/443 from @scanner_clients in input and forward chains.
+    Rules are safe to keep permanently since empty set means no effect.
+    """
+    try:
+        # Ensure set exists before referencing in rules
+        nft_ensure_set("scanner_clients")
+        # Ensure table exists (it should due to other uses)
+        run("nft list table inet filter", check=False)
+        # Check and add for input chain
+        res_in = run("nft list chain inet filter input", check=False)
+        txt_in = res_in.stdout.decode(errors="ignore") if getattr(res_in, 'stdout', None) else ""
+        if "scanner_clients" not in txt_in:
+            run("nft add rule inet filter input udp dport 443 ip saddr @scanner_clients counter drop", check=False)
+        # Check and add for forward chain
+        res_fw = run("nft list chain inet filter forward", check=False)
+        txt_fw = res_fw.stdout.decode(errors="ignore") if getattr(res_fw, 'stdout', None) else ""
+        if "scanner_clients" not in txt_fw:
+            run("nft add rule inet filter forward udp dport 443 ip saddr @scanner_clients counter drop", check=False)
+    except Exception:
+        # best-effort; log but do not raise
+        try:
+            log("nft: failed ensuring scanner QUIC drop rules (best-effort)")
+        except Exception:
+            pass
+    return None
+
+
 def _last_dns_domain_for_client(cip: str, window_sec: float, now_ts: float):
     """Return most recent DNS domain queried by client ip within window_sec, else None."""
     if not cip:
@@ -488,6 +516,18 @@ def render_coredns_targets(domains, healthy_ips):
     lines.append("}")
     return "\n".join(lines) + "\n"
 
+def render_scanner_targets(healthy_ips):
+    """Catch-all CoreDNS template to direct ALL A queries to selected proxy IPs.
+    This is used only during Scanner Mode windows.
+    """
+    lines = ["template IN A {", r"  match ^(.*)\\.$"]
+    ttl = 30
+    for ip in healthy_ips:
+        lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
+    # no fallthrough: we want to answer everything during scan
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
 def _ensure_acl_symlink():
     """برای CoreDNS native مسیر import را تضمین می‌کند.
     برای سه فایل override (acl, targets, v6block) symlink می‌سازد تا Corefile بتواند import کند.
@@ -518,6 +558,13 @@ def render_v6block(domains):
   match {regex}
   rcode NOERROR
 }}
+"""
+
+def render_scanner_v6block():
+    return """template IN AAAA {
+  match ^(.*)\.$
+  rcode NOERROR
+}
 """
 
 def render_coredns_acl(dns_clients, enforce: bool):
@@ -1147,8 +1194,26 @@ def main():
             # Fallback: اگر سالمی نبود، همه را استفاده کن
             selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
             # Render CoreDNS override files
-            targets = render_coredns_targets(domains, selected)
-            v6blk = render_v6block(domains)
+            # Scanner mode: when active, override targets/v6block with catch-all, and set nft scanner clients
+            sc = conf.get("scanner") or {}
+            active = bool(sc.get("active", False))
+            not_expired = (time.time() < float(sc.get("expires_ts", 0)))
+            sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
+            if active and not_expired:
+                log(f"scanner: ACTIVE - applying catch-all for clients={sc_clients} (block_quic={bool(sc.get('block_quic', True))})")
+                # Update nft set for scanner clients and ensure QUIC drop rules
+                nft_ensure_set("scanner_clients")
+                nft_replace_set("scanner_clients", sc_clients)
+                if bool(sc.get("block_quic", True)):
+                    nft_ensure_scanner_quic_drop_rules()
+                targets = render_scanner_targets(selected)
+                v6blk = render_scanner_v6block()
+            else:
+                # Clear scanner set so drop rules have no effect
+                nft_ensure_set("scanner_clients")
+                nft_replace_set("scanner_clients", [])
+                targets = render_coredns_targets(domains, selected)
+                v6blk = render_v6block(domains)
             acltxt = render_coredns_acl(dns_clients, enforce_dns)
             Path(f"{DEF_CORE_DNS_DIR}/targets.override").write_text(targets)
             Path(f"{DEF_CORE_DNS_DIR}/v6block.override").write_text(v6blk)
@@ -1179,15 +1244,36 @@ def main():
             # Update nft set of allowed proxy clients
             if enforce_proxy:
                 # Only allow Iran DNS nodes (required), plus any explicit proxy-scope clients (if defined)
-                allowed_proxy_clients = sorted(set(proxy_clients + dns_node_ips))
+                # When scanner is active, also allow scanner clients temporarily.
+                sc = conf.get("scanner") or {}
+                active = bool(sc.get("active", False))
+                not_expired = (time.time() < float(sc.get("expires_ts", 0)))
+                sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
+                base_clients = sorted(set(proxy_clients + dns_node_ips))
+                allowed_proxy_clients = (sorted(set(base_clients + sc_clients)) if (active and not_expired) else base_clients)
                 ipv4_allowed = only_ipv4(allowed_proxy_clients)
                 log(f"proxy: enforcement enabled, updating allowlist with {len(ipv4_allowed)} clients -> {ipv4_allowed}")
-                log(f"proxy: allowlist breakdown -> proxy_clients={proxy_clients}, dns_nodes={dns_node_ips}")
+                log(f"proxy: allowlist breakdown -> proxy_clients={proxy_clients}, dns_nodes={dns_node_ips}, scanner_clients={(sc_clients if (active and not_expired) else [])}")
                 nft_replace_set("allow_proxy_clients", ipv4_allowed)
             else:
                 # When enforcement is disabled, clear the set to reflect runtime state
                 log("proxy: enforcement disabled, clearing allowlist")
                 nft_replace_set("allow_proxy_clients", [])
+
+            # Scanner mode on proxy: ensure scanner_clients set and (optionally) drop UDP/443 from those clients
+            sc = conf.get("scanner") or {}
+            active = bool(sc.get("active", False))
+            not_expired = (time.time() < float(sc.get("expires_ts", 0)))
+            sc_clients = only_ipv4([str(ip) for ip in (sc.get("clients") or [])])
+            nft_ensure_set("scanner_clients")
+            if active and not_expired and sc_clients:
+                log(f"proxy: scanner ACTIVE - updating scanner_clients set -> {sc_clients}")
+                nft_replace_set("scanner_clients", sc_clients)
+                if bool(sc.get("block_quic", True)):
+                    nft_ensure_scanner_quic_drop_rules()
+            else:
+                # empty set disables effect of drop rules
+                nft_replace_set("scanner_clients", [])
             # Render sniproxy.conf from template
             conf_txt = render_sniproxy_conf(domains)
             out_path = Path(DEF_PROXY_DIR) / "sniproxy.conf"

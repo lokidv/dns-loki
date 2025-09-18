@@ -266,6 +266,8 @@ class ConfigOut(BaseModel):
     ui_auth_enabled: bool = False
     internal_auth_enabled: bool = False
     internal_auth_source: Optional[str] = "none"
+    # New: scanner mode configuration
+    scanner: Optional[dict] = None
 
 class DomainsPayload(BaseModel):
     domains: List[str]
@@ -278,6 +280,13 @@ class FlagsPayload(BaseModel):
     enforce_dns_clients: Optional[bool] = None
     enforce_proxy_clients: Optional[bool] = None
     enforce_token_on_reads: Optional[bool] = None
+
+
+# ===== Scanner mode =====
+class ScannerStartPayload(BaseModel):
+    clients: Optional[List[IPvAnyAddress]] = None
+    duration_sec: int = 120
+    block_quic: bool = True
 
 
 class ProvisionRequest(BaseModel):
@@ -317,6 +326,7 @@ def _load_state():
             "enforce_dns_clients": True,
             "enforce_proxy_clients": False,
             "domains": [],
+            "scanner": {"active": False, "expires_ts": 0, "clients": [], "block_quic": True},
         }
         with open(STATE_PATH, "w") as f:
             json.dump(st, f)
@@ -333,6 +343,7 @@ def _load_state():
     st.setdefault("enforce_dns_clients", True)
     st.setdefault("enforce_proxy_clients", False)
     st.setdefault("domains", [])
+    st.setdefault("scanner", {"active": False, "expires_ts": 0, "clients": [], "block_quic": True})
     _save_state(st)
     return st
 
@@ -352,6 +363,54 @@ def get_config():
         st["internal_auth_enabled"] = bool(tok)
         st["internal_auth_source"] = src
         return st
+
+
+@app.get("/v1/scanner")
+def scanner_status():
+    with LOCK:
+        st = _load_state()
+        sc = st.get("scanner") or {}
+        now = time.time()
+        remaining = max(0, int((sc.get("expires_ts") or 0) - now)) if sc.get("active") else 0
+        return {
+            "active": bool(sc.get("active", False)),
+            "expires_ts": sc.get("expires_ts", 0),
+            "remaining_sec": remaining,
+            "clients": sc.get("clients", []),
+            "block_quic": bool(sc.get("block_quic", True)),
+        }
+
+
+@app.post("/v1/scanner/start", dependencies=[Depends(require_internal)])
+def scanner_start(p: ScannerStartPayload):
+    dur = int(p.duration_sec or 120)
+    if dur < 10:
+        dur = 10
+    if dur > 3600:
+        dur = 3600
+    with LOCK:
+        st = _load_state()
+        now = time.time()
+        st["scanner"] = {
+            "active": True,
+            "expires_ts": now + dur,
+            "clients": [str(ip) for ip in (p.clients or [])],
+            "block_quic": bool(p.block_quic),
+        }
+        _save_state(st)
+        return {"ok": True, "scanner": st["scanner"]}
+
+
+@app.post("/v1/scanner/stop", dependencies=[Depends(require_internal)])
+def scanner_stop():
+    with LOCK:
+        st = _load_state()
+        sc = st.get("scanner") or {}
+        sc["active"] = False
+        sc["expires_ts"] = 0
+        st["scanner"] = sc
+        _save_state(st)
+        return {"ok": True, "scanner": sc}
 
 
 @app.get("/v1/clients", response_model=List[Client])
