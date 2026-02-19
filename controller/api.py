@@ -146,7 +146,13 @@ def _save_state(st):
 def get_config():
     with LOCK:
         st = _load_state()
-        return st
+        # Strip heavy diag data from nodes to keep response small for agents
+        light = dict(st)
+        light["nodes"] = [
+            {k: v for k, v in n.items() if k != "diag"}
+            for n in light.get("nodes", [])
+        ]
+        return light
 
 
 @app.get("/v1/clients", response_model=List[Client])

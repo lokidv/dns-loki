@@ -190,7 +190,7 @@ def read_domains_list():
 
 def fetch_domains_from_api(controller_url: str):
     try:
-        r = requests.get(f"{controller_url}/v1/domains", timeout=5)
+        r = requests.get(f"{controller_url}/v1/domains", timeout=15)
         if r.status_code == 200:
             items = r.json()
             if isinstance(items, list):
@@ -505,7 +505,7 @@ def main():
 
     while True:
         try:
-            conf = requests.get(f"{controller_url}/v1/config", timeout=5).json()
+            conf = requests.get(f"{controller_url}/v1/config", timeout=15).json()
         except Exception as e:
             log(f"loop: failed fetching controller config -> {e}")
             time.sleep(5)
@@ -514,7 +514,7 @@ def main():
         # Self-discover ip once
         if not self_registered:
             try:
-                my_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+                my_ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
                 self_registered = True
             except Exception:
                 my_ip = None
@@ -562,8 +562,8 @@ def main():
                     
                     # Report success to controller
                     try:
-                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                        requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
+                        requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=15)
                         log(f"update-apply: reported success to controller")
                     except Exception as e:
                         log(f"update-apply: failed reporting to controller -> {e}")
@@ -583,8 +583,8 @@ def main():
             # Versions match - still report to controller periodically
             if my_ip and agents_version_applied > 0:
                 try:
-                    report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied}
-                    requests.post(f"{controller_url}/v1/nodes/register", json=report_data, timeout=5)
+                    report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
+                    requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=15)
                 except Exception:
                     pass  # Silent fail for periodic reports
 
@@ -629,8 +629,13 @@ def main():
                     lat_map[ip] = lat
                     if best_lat is None or lat < best_lat:
                         best_lat, best_ip = lat, ip
-            # Fallback: اگر سالمی نبود، همه را استفاده کن
-            selected = [best_ip] if healthy and best_ip else (proxy_ips if not healthy else [healthy[0]])
+            # انتخاب نهایی: همه IPهای سالم به ترتیب کمترین تاخیر؛ اگر سالم نبود، همه پراکسی‌ها
+            try:
+                # مرتب‌سازی IPهای سالم بر اساس تاخیر صعودی
+                healthy_sorted = sorted(healthy, key=lambda ip: lat_map.get(ip, 1e9)) if healthy else []
+            except Exception:
+                healthy_sorted = list(healthy) if healthy else []
+            selected = healthy_sorted if healthy_sorted else list(proxy_ips)
             # Render CoreDNS override files
             targets = render_coredns_targets(domains, selected)
             v6blk = render_v6block(domains)
@@ -744,7 +749,7 @@ def main():
             }
             if my_ip:
                 hb["ip"] = my_ip
-            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5)
+            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=15)
         except Exception as e:
             log(f"heartbeat: failed to post -> {e}")
 
