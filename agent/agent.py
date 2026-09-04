@@ -209,7 +209,7 @@ def read_domains_list():
 
 def fetch_domains_from_api(controller_url: str, headers=None):
     try:
-        r = requests.get(f"{controller_url}/v1/domains", timeout=5, headers=headers)
+        r = requests.get(f"{controller_url}/v1/domains", timeout=30, headers=headers)
         if r.status_code == 200:
             items = r.json()
             if isinstance(items, list):
@@ -229,6 +229,51 @@ def fetch_domains_from_api(controller_url: str, headers=None):
     return []
 
 
+def send_heartbeat(controller_url, headers, role, my_ip, agents_version_applied, diag=None, timeout=20):
+    if not my_ip:
+        log("heartbeat: skipped, no node ip")
+        return False
+    hb = {
+        "ip": my_ip,
+        "role": role,
+        "enabled": True,
+        "agents_version_applied": int(agents_version_applied or 0),
+        "ts": time.time(),
+    }
+    if diag is not None:
+        hb["diag"] = diag
+    try:
+        r = requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=timeout, headers=headers)
+        if r.status_code < 400:
+            return True
+        log(f"heartbeat: http {r.status_code}")
+    except Exception as e:
+        log(f"heartbeat: failed to post -> {e}")
+    if diag is None:
+        return False
+    hb.pop("diag", None)
+    try:
+        r = requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=timeout, headers=headers)
+        return r.status_code < 400
+    except Exception as e:
+        log(f"heartbeat: slim retry failed -> {e}")
+        return False
+
+
+def fetch_controller_conf(controller_url, headers):
+    try:
+        r = requests.get(f"{controller_url}/v1/tick", timeout=15, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and "domains_version" in data:
+                return data
+    except Exception as e:
+        log(f"loop: tick failed -> {e}")
+    r = requests.get(f"{controller_url}/v1/config", timeout=20, headers=headers)
+    r.raise_for_status()
+    return r.json()
+
+
 def build_regex_from_domains(domains):
     # Convert list like ["amd.com", "*.amd.com"] into a regex alternation
     cleaned = []
@@ -241,15 +286,49 @@ def build_regex_from_domains(domains):
     return "^(" + "|".join(cleaned) + ")\\.$"
 
 
+def normalize_apex_domains(domains):
+    """Deduplicate and drop children when a parent apex is already listed."""
+    cleaned = []
+    seen = set()
+    for d in domains:
+        d = str(d).lstrip("*.").strip().lower()
+        if d and d not in seen:
+            seen.add(d)
+            cleaned.append(d)
+    listed = set(cleaned)
+    out = []
+    for d in cleaned:
+        parts = d.split(".")
+        drop = False
+        for i in range(1, max(len(parts) - 1, 0)):
+            parent = ".".join(parts[i:])
+            if parent in listed:
+                drop = True
+                break
+        if not drop:
+            out.append(d)
+    return out
+
+
+def _chunked(items, size=40):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def render_coredns_targets(domains, healthy_ips):
-    regex = build_regex_from_domains(domains)
-    lines = ["template IN A {", f"  match {regex}"]
+    # CoreDNS/RE2 rejects one giant alternation; split into smaller template blocks.
+    domains = normalize_apex_domains(domains)
     ttl = 60
-    for ip in healthy_ips:
-        lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
-    lines.append("  fallthrough")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+    blocks = []
+    for chunk in _chunked(domains, 40):
+        regex = build_regex_from_domains(chunk)
+        lines = ["template IN A {", f"  match {regex}"]
+        for ip in healthy_ips:
+            lines.append(f"  answer \"{{{{ .Name }}}} {ttl} IN A {ip}\"")
+        lines.append("  fallthrough")
+        lines.append("}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks) + "\n"
 
 def _ensure_acl_symlink():
     """برای CoreDNS native مسیر import را تضمین می‌کند.
@@ -276,12 +355,17 @@ def _ensure_acl_symlink():
 
 
 def render_v6block(domains):
-    regex = build_regex_from_domains(domains)
-    return f"""template IN AAAA {{
+    domains = normalize_apex_domains(domains)
+    blocks = []
+    for chunk in _chunked(domains, 40):
+        regex = build_regex_from_domains(chunk)
+        blocks.append(
+            f"""template IN AAAA {{
   match {regex}
   rcode NOERROR
-}}
-"""
+}}"""
+        )
+    return "\n".join(blocks) + "\n"
 
 def render_coredns_acl(dns_clients, enforce: bool):
     """تولید فایل acl.override برای CoreDNS.
@@ -476,6 +560,46 @@ def tls_health_check(ip: str, sni_host: str, timeout=3.0) -> bool:
         return False
 
 
+def _is_usable_node_ip(ip: str) -> bool:
+    """Accept a host IPv4; skip loopback, link-local, and RFC1918/docker bridges."""
+    s = (ip or "").strip()
+    if s.count(".") != 3 or s.startswith("127.") or s in {"0.0.0.0", "::1"}:
+        return False
+    try:
+        a, b, c, d = (int(x) for x in s.split("."))
+        for n in (a, b, c, d):
+            if n < 0 or n > 255:
+                return False
+    except Exception:
+        return False
+    if a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31) or (a == 169 and b == 254):
+        return False
+    return True
+
+
+def discover_node_ip(cfg) -> str | None:
+    """Resolve this node's IPv4. Prefer config, then interface address, never loopback."""
+    configured = str(cfg.get("node_ip") or cfg.get("public_ip") or "").strip()
+    if _is_usable_node_ip(configured):
+        return configured
+    try:
+        res = run("hostname -I", check=False)
+        text = (res.stdout or b"").decode("utf-8", "replace")
+        for tok in text.split():
+            if _is_usable_node_ip(tok):
+                return tok
+    except Exception:
+        pass
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            ip = requests.get(url, timeout=4).text.strip().split()[0]
+            if _is_usable_node_ip(ip):
+                return ip
+        except Exception:
+            continue
+    return None
+
+
 def tls_probe_latency(ip: str, sni_host: str, timeout=3.0):
     """انجام هندشیک TLS و ارسال یک درخواست HEAD کوچک برای سنجش تاخیر.
     خروجی: (ok: bool, latency_ms: float|None)
@@ -526,20 +650,21 @@ def main():
     my_ip = None
 
     while True:
+        if not my_ip:
+            my_ip = discover_node_ip(cfg)
+            if my_ip:
+                self_registered = True
+                log(f"init: node ip -> {my_ip}")
+            else:
+                log("init: could not discover node ip; heartbeat will be skipped until resolved")
+
         try:
-            conf = requests.get(f"{controller_url}/v1/config", timeout=5, headers=headers).json()
+            conf = fetch_controller_conf(controller_url, headers)
         except Exception as e:
             log(f"loop: failed fetching controller config -> {e}")
+            send_heartbeat(controller_url, headers, role, my_ip, agents_version_applied, diag=None)
             time.sleep(5)
             continue
-
-        # Self-discover ip once
-        if not self_registered:
-            try:
-                my_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
-                self_registered = True
-            except Exception:
-                my_ip = None
 
         # Build client allowlists per scope
         dns_clients = [str(c["ip"]) for c in conf.get("clients", []) if "dns" in c.get("scope", ["dns", "proxy"]) ]
@@ -584,9 +709,10 @@ def main():
                     
                     # Report success to controller
                     try:
-                        report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
-                        requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=5, headers=headers)
-                        log(f"update-apply: reported success to controller")
+                        if my_ip:
+                            report_data = {"ip": my_ip, "role": role, "agents_version_applied": agents_version_applied, "ts": time.time()}
+                            requests.post(f"{controller_url}/v1/nodes", json=report_data, timeout=5, headers=headers)
+                            log(f"update-apply: reported success to controller")
                     except Exception as e:
                         log(f"update-apply: failed reporting to controller -> {e}")
                     
@@ -619,10 +745,14 @@ def main():
                 domains_version_seen = conf.get("domains_version")
             domains = read_domains_list()
         else:
-            # pull from API; refresh each loop is cheap, rendering is idempotent
             if domains_version_seen != conf.get("domains_version"):
                 domains_version_seen = conf.get("domains_version")
-            domains = fetch_domains_from_api(controller_url, headers=headers)
+            # Prefer domains already in /v1/config (Utah→Iran GET /v1/domains often stalls)
+            domains = [str(d).strip().lower() for d in (conf.get("domains") or []) if str(d).strip()]
+            if not domains:
+                domains = fetch_domains_from_api(controller_url, headers=headers)
+                if not domains:
+                    log("domains: fetch empty; proxy table will be incomplete until config includes domains")
         # Fallback seed for testing if still empty
         if not domains:
             domains = ["amd.com", "*.amd.com"]
@@ -701,11 +831,6 @@ def main():
                         log("sniproxy: start skipped; docker not ready")
 
         # Build diagnostics after applying configs
-        # Gather runtime nft set elements (best-effort)
-        nft_dns_elems = nft_list_set("allow_dns_clients") if role == "dns" else None
-        nft_proxy_elems = nft_list_set("allow_proxy_clients") if role == "proxy" else None
-        # Compute effective allowlists from config perspective
-        proxy_effective_allow = sorted(set(proxy_clients + dns_node_ips)) if proxy_clients or dns_node_ips else []
         diag = {
             "role": role,
             "domains_count": len(domains),
@@ -713,18 +838,8 @@ def main():
             "proxies_healthy": len(healthy) if healthy else 0,
             "selected_proxy": (best_ip if role == "dns" else None),
             "selected_latency_ms": (round(best_lat, 1) if (role == "dns" and best_lat is not None) else None),
-            "proxies_latency_ms": (lat_map if role == "dns" else None),
             "enforce_dns": bool(enforce_dns),
             "enforce_proxy": bool(enforce_proxy),
-            "client_allowlists": {
-                "dns_clients_configured": only_ipv4(dns_clients),
-                "proxy_clients_configured": only_ipv4(proxy_clients),
-                "proxy_effective_allowlist": only_ipv4(proxy_effective_allow),
-            },
-            "nft_sets": {
-                "allow_dns_clients": (nft_dns_elems or []),
-                "allow_proxy_clients": (nft_proxy_elems or []),
-            },
             "svc": {
                 "coredns_running": _is_container_running(f"{DEF_CORE_DNS_DIR}/docker-compose.yml", "coredns") if role == "dns" else None,
                 "sniproxy_running": _is_container_running(f"{DEF_PROXY_DIR}/docker-compose.yml", "sniproxy") if role == "proxy" else None,
@@ -733,10 +848,6 @@ def main():
                 "targets_override": {
                     "exists": Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists(),
                     "size": (Path(f"{DEF_CORE_DNS_DIR}/targets.override").stat().st_size if Path(f"{DEF_CORE_DNS_DIR}/targets.override").exists() else 0),
-                },
-                "acl_override": {
-                    "exists": Path(f"{DEF_CORE_DNS_DIR}/acl.override").exists(),
-                    "size": (Path(f"{DEF_CORE_DNS_DIR}/acl.override").stat().st_size if Path(f"{DEF_CORE_DNS_DIR}/acl.override").exists() else 0),
                 },
                 "sniproxy_conf": {
                     "exists": Path(f"{DEF_PROXY_DIR}/sniproxy.conf").exists(),
@@ -755,20 +866,7 @@ def main():
         except Exception as e:
             log(f"loop: failed reading last_agents_version -> {e}")
 
-        # Heartbeat / upsert node with diagnostics and version (always send)
-        try:
-            hb = {
-                "role": role,
-                "enabled": True,
-                "agents_version_applied": int(agents_version_applied),
-                "ts": time.time(),
-                "diag": diag,
-            }
-            if my_ip:
-                hb["ip"] = my_ip
-            requests.post(f"{controller_url}/v1/nodes", json=hb, timeout=5, headers=headers)
-        except Exception as e:
-            log(f"heartbeat: failed to post -> {e}")
+        send_heartbeat(controller_url, headers, role, my_ip, agents_version_applied, diag=diag)
 
         time.sleep(cfg.get("health_check_interval_seconds", 10))
 

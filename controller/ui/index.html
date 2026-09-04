@@ -455,7 +455,8 @@ async function loadNodes(){
           status = 'نیاز به آپدیت';
         }
       }
-    } else { cls='warn'; status='نامشخص'; }
+    } else { cls='err'; status='آفلاین'; }
+    const online = !!(ts && (now - ts) <= 180);
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="cell-ip"><code>${n.ip}</code></td>
@@ -464,7 +465,7 @@ async function loadNodes(){
       <td class="right">${target??'—'}</td>
       <td><span class="status ${cls}">${status}</span></td>
       <td>${ts? fmtAgo(ts): '—'}</td>
-      <td>${n.enabled ? '<span class="status ok">فعال</span>' : '<span class="status err">غیرفعال</span>'}</td>
+      <td>${online ? (n.enabled ? '<span class="status ok">فعال</span>' : '<span class="status err">غیرفعال</span>') : '<span class="status err">آفلاین</span>'}</td>
       <td class="cell-actions">
         <div class="input-inline" style="gap:6px;">
           <button class="btn-details">جزئیات</button>
@@ -523,7 +524,7 @@ async function loadNodes(){
             <b>Proxy allowlist (config)</b><div>${proxyCfg || '—'} ${proxyCfgArr.length? `<span class='pill'>${proxyCfgArr.length}</span>`:''}</div>
             <b>Proxy allowlist (effective)</b><div>${proxyEff || '—'} ${proxyEffArr.length? `<span class='pill'>${proxyEffArr.length}</span>`:''}</div>
             <b>Proxy allowlist (nft)</b><div>${proxyNft || '—'} ${proxyNftArr.length? `<span class='pill'>${proxyNftArr.length}</span>`:''}</div>
-            <b>Agent</b><div>${agentRun}</div>
+            <b>Agent</b><div>${agentRun}${online ? '' : ' — ایجنت نصب نشده یا به کنترلر وصل نشده'}</div>
             <b>CoreDNS</b><div>${coreRun}</div>
             <b>SNI Proxy</b><div>${sniRun}</div>
             <b>targets.override</b><div>${targ.exists? 'بله' : 'خیر'} ${targ.size? `(${targ.size} B)` : ''}</div>

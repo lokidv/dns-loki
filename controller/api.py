@@ -23,7 +23,24 @@ DATA_DIR = os.environ.get("DATA_DIR", "/opt/dns-proxy/data")
 DEFAULT_GIT_REPO = os.environ.get("DEFAULT_GIT_REPO", "")
 DEFAULT_GIT_BRANCH = os.environ.get("DEFAULT_GIT_BRANCH", "main")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
-LOCK = threading.Lock()
+LOCK = threading.RLock()
+
+
+def _is_loopback_ip(ip: str) -> bool:
+    s = (ip or "").strip().lower()
+    return s in {"127.0.0.1", "::1", "localhost"} or s.startswith("127.")
+
+
+def _local_non_loopback_ipv4s() -> List[str]:
+    ips: List[str] = []
+    try:
+        text = subprocess.check_output(["hostname", "-I"], text=True, timeout=3)
+        for tok in text.split():
+            if tok.count(".") == 3 and not _is_loopback_ip(tok):
+                ips.append(tok)
+    except Exception:
+        pass
+    return ips
 
 app = FastAPI(title="DNS+SNI Control Plane")
 
@@ -253,6 +270,7 @@ class NodeIn(BaseModel):
 class ConfigOut(BaseModel):
     clients: List[Client]
     nodes: List[Node]
+    domains: List[str] = []
     domains_version: int
     git_repo: str
     git_branch: str
@@ -351,7 +369,46 @@ def get_config():
         tok, src = _get_effective_internal_token()
         st["internal_auth_enabled"] = bool(tok)
         st["internal_auth_source"] = src
+        # Keep /v1/config small; Utah agents time out on bulky node.diag payloads
+        lean_nodes = []
+        for n in st.get("nodes") or []:
+            n2 = dict(n)
+            n2.pop("diag", None)
+            lean_nodes.append(n2)
+        st["nodes"] = lean_nodes
         return st
+
+
+@app.get("/v1/tick")
+def get_tick():
+    """Tiny config for remote agents; Utah→Iran /v1/config often stalls."""
+    with LOCK:
+        st = _load_state()
+        return {
+            "domains_version": int(st.get("domains_version", 1)),
+            "agents_version": int(st.get("agents_version", 1)),
+            "git_repo": st.get("git_repo") or "",
+            "git_branch": st.get("git_branch") or "main",
+            "code_repo": st.get("code_repo") or "",
+            "code_branch": st.get("code_branch") or "main",
+            "enforce_dns_clients": bool(st.get("enforce_dns_clients", True)),
+            "enforce_proxy_clients": bool(st.get("enforce_proxy_clients", False)),
+            "nodes": [
+                {
+                    "ip": x.get("ip"),
+                    "role": x.get("role"),
+                    "enabled": x.get("enabled", True),
+                }
+                for x in (st.get("nodes") or [])
+            ],
+            "clients": [
+                {
+                    "ip": x.get("ip"),
+                    "scope": x.get("scope") or ["dns", "proxy"],
+                }
+                for x in (st.get("clients") or [])
+            ],
+        }
 
 
 @app.get("/v1/clients", response_model=List[Client])
@@ -570,6 +627,19 @@ def upsert_node(n: NodeIn, request: Request):
         st = _load_state()
         # Derive IP from payload or request if missing
         ip_str = str(n.ip) if n.ip is not None else request.client.host
+        # Agent on the same host as controller often posts via 127.0.0.1; never persist loopback as a node
+        if _is_loopback_ip(ip_str):
+            local_ips = _local_non_loopback_ipv4s()
+            existing = [
+                x for x in st["nodes"]
+                if str(x.get("ip")) in local_ips and str(x.get("role")) == str(n.role)
+            ]
+            if existing:
+                ip_str = str(existing[0]["ip"])
+            elif local_ips:
+                ip_str = local_ips[0]
+            else:
+                return st["nodes"]
         n_payload = {
             "ip": ip_str,
             "role": n.role,
@@ -583,10 +653,13 @@ def upsert_node(n: NodeIn, request: Request):
                 # Preserve existing values when incoming fields are None (avoid erasing)
                 old_diag = x.get("diag")
                 old_ver = x.get("agents_version_applied")
+                old_ts = x.get("ts")
                 x.update(n_payload)
-                # Restore diag if missing in payload
+                # Restore diag/ts if missing in payload
                 if x.get("diag") is None and old_diag is not None:
                     x["diag"] = old_diag
+                if x.get("ts") is None and old_ts is not None:
+                    x["ts"] = old_ts
                 # Do not let agents_version_applied decrease due to stale heartbeats
                 incoming_ver = n_payload.get("agents_version_applied")
                 if incoming_ver is None:
